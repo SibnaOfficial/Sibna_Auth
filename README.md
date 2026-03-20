@@ -1,4 +1,4 @@
-# SIBNA Authentication System
+je# SIBNA Authentication System
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Flutter](https://img.shields.io/badge/Flutter-%2302569B.svg?logo=Flutter&logoColor=white)
@@ -74,7 +74,7 @@ flutter run
 ---
 
 ## 🛡️ Security Architecture
-1. **Initial Flow:** User enters Phone/Email -> Backend limits rate -> Backend dispatches beautiful 8-digit OTP Email.
+1. **Initial Flow:** User enters Phone/Email -> Backend limits rate -> Backend dispatches beautiful 6-digit OTP Email.
 2. **Verification:** User enters OTP -> Backend verifies hash -> Backend signs a 30-day JWT -> Frontend receives and encrypts JWT to hardware.
 3. **Session Re-entry:** User opens app -> Splash Screen reads Keystore -> Validates JWT -> Auto-routes to internal app views.
 
