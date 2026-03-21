@@ -1,8 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import '../../../core/constants/constants.dart';
+import '../../../core/services/api_service.dart';
 import 'auth_screen.dart';
 import '../../vault/presentation/vault_screen.dart';
-import '../../../core/constants/constants.dart';
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
@@ -19,26 +20,20 @@ class _SplashScreenState extends State<SplashScreen> {
   }
 
   Future<void> _checkSession() async {
-    // Artificial delay to show the nice splash screen logo
-    await Future.delayed(const Duration(seconds: 2)); 
-    
-    // Check for Enterprise Session Token
-    const storage = FlutterSecureStorage();
-    final token = await storage.read(key: 'jwt_token');
+    // Brief delay to show the splash UI
+    await Future.delayed(const Duration(seconds: 2));
+    if (!mounted) return;
+
+    // Validate JWT expiry before auto-login
+    final isValid = await ApiService.instance.hasValidToken();
 
     if (!mounted) return;
 
-    if (token != null && token.isNotEmpty) {
-      // Valid session found -> Auto Login -> Route to Vault directly
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => const VaultScreen()),
-      );
-    } else {
-      // No session -> Route to Login Auth Screen
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => const AuthScreen()),
-      );
-    }
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(
+        builder: (_) => isValid ? const VaultScreen() : const AuthScreen(),
+      ),
+    );
   }
 
   @override
@@ -49,10 +44,10 @@ class _SplashScreenState extends State<SplashScreen> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const Icon(Icons.security, size: 80, color: Colors.white),
+            const Icon(Icons.security_rounded, size: 80, color: Colors.white),
             const SizedBox(height: 24),
             Text(
-              'SIBNA',
+              AppConstants.appName,
               style: Theme.of(context).textTheme.headlineLarge?.copyWith(
                 color: Colors.white,
                 fontWeight: FontWeight.bold,
@@ -61,11 +56,14 @@ class _SplashScreenState extends State<SplashScreen> {
             ),
             const SizedBox(height: 8),
             const Text(
-              'Enterprise Security Vault',
+              'Secure Communication',
               style: TextStyle(color: Colors.white70, letterSpacing: 1),
             ),
             const SizedBox(height: 48),
-            const CircularProgressIndicator(color: AppColors.accent),
+            const CircularProgressIndicator(
+              color: AppColors.accent,
+              strokeWidth: 2,
+            ),
           ],
         ),
       ),

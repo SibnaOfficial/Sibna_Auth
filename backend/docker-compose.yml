@@ -2,18 +2,29 @@ services:
   db:
     image: postgres:15-alpine
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: strongpassword
-      POSTGRES_DB: zerpasswd
+      POSTGRES_USER: ${POSTGRES_USER:-sibna}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}   # Required — set in .env
+      POSTGRES_DB: ${POSTGRES_DB:-sibna_auth}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sibna}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   redis:
     image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   backend:
     build: .
@@ -22,9 +33,11 @@ services:
     env_file:
       - .env
     depends_on:
-      - db
-      - redis
-    restart: always
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   postgres_data:

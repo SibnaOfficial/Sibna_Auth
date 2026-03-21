@@ -1,30 +1,41 @@
-#!/bin/bash
-# SIBNA Backend Startup Script
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "🚀 Starting SIBNA Authentication Backend..."
-echo "============================================"
+echo "SIBNA Authentication Backend — starting"
+echo "======================================="
 
-# Check Python
-if ! command -v python3 &> /dev/null; then
-    echo "❌ Python3 is not installed"
+if ! command -v python3 &>/dev/null; then
+    echo "ERROR: python3 is not installed." >&2
     exit 1
 fi
 
-# Create virtual environment if not exists
+PYTHON_VERSION=$(python3 -c 'import sys; print(sys.version_info.major * 10 + sys.version_info.minor)')
+if [ "$PYTHON_VERSION" -lt 310 ]; then
+    echo "ERROR: Python 3.10+ required (found $(python3 --version))." >&2
+    exit 1
+fi
+
 if [ ! -d "venv" ]; then
-    echo "📦 Creating virtual environment..."
+    echo "Creating virtual environment..."
     python3 -m venv venv
 fi
 
-# Activate virtual environment
 source venv/bin/activate
 
-# Install dependencies
-echo "📥 Installing dependencies..."
+echo "Installing dependencies..."
+pip install -q --upgrade pip
 pip install -q -r requirements.txt
 
-# Start server
-echo "✅ Starting FastAPI server on http://localhost:8000"
-echo "📚 API Docs: http://localhost:8000/docs"
-echo ""
-python3 -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+if [ -z "${SECRET_KEY:-}" ] || [ -z "${JWT_SECRET:-}" ]; then
+    echo ""
+    echo "WARNING: SECRET_KEY or JWT_SECRET is not set."
+    echo "Copy .env.example to .env and configure all required values."
+    echo ""
+fi
+
+echo "Server starting on http://0.0.0.0:${PORT:-8000}"
+
+python3 -m uvicorn main:app \
+    --host 0.0.0.0 \
+    --port "${PORT:-8000}" \
+    --reload

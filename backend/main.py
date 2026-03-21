@@ -1,230 +1,197 @@
 """
-SIBNA Authentication System - Final Version
-============================================
-Complete authentication system supporting:
-- Automatic SIM detection (Auto-detection)
-- Phone number validation
-- Email OTP (8 ) 
-- Global country support
-- High security with HMAC + Salt
-- Automatic fallback if SIM fails
+SIBNA Authentication System — v3.0.0
+======================================
+Secure authentication system supporting:
+- SIM card auto-detection and verification
+- Phone number validation (libphonenumber)
+- Email OTP (6 digits, cryptographically secure)
+- JWT session tokens
+- Challenge-response authentication
+- Account recovery via email
+- Multi-device management
+- Full audit logging
 """
 
 import hmac
 import hashlib
 import time
 import secrets
-import random
 import os
 import json
-import jwt
 import asyncio
 import smtplib
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
+import logging
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any
+
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Depends
+import jwt
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Depends, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, EmailStr, Field, validator
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, EmailStr, Field, field_validator
+
 import phonenumbers
-from phonenumbers import carrier, geocoder, timezone
+from phonenumbers import carrier, geocoder, timezone as ph_timezone
 
 from sqlalchemy import create_engine, Column, Integer, String, Float, Text, Boolean, UniqueConstraint
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import DeclarativeBase, sessionmaker, Session
 import redis
+
 from config import Config
 
-# ============================================
-# Pydantic Models
-# ============================================
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Use structured logging — never log sensitive values (OTP, keys, tokens)
+logging.basicConfig(
+    level=logging.DEBUG if Config.DEBUG else logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("sibna.auth")
 
-class PhoneRequest(BaseModel):
-    phone: str = Field(..., description="Phone number")
-    country_code: Optional[str] = Field(None, description="Country code")
-    device_id: Optional[str] = Field(None, description="Device ID")
-    device_name: Optional[str] = Field(None, description="Device name")
-    device_type: Optional[str] = Field(None, description="Device type")
+# ── Startup / Shutdown ────────────────────────────────────────────────────────
 
-class SIMVerifyRequest(BaseModel):
-    sim_phone: Optional[str] = Field(None, description="SIM phone number")
-    entered_phone: str = Field(..., description="Entered phone number")
-    country_code: Optional[str] = Field(None, description="Country code")
-    device_id: str = Field(..., description="Device ID")
-    device_name: Optional[str] = None
-    device_type: Optional[str] = None
-    sim_info: Optional[Dict[str, Any]] = Field(None, description="Additional SIM info")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Config.validate()
+    init_db()
+    logger.info("SIBNA Auth started — environment: %s", Config.ENVIRONMENT)
+    yield
+    logger.info("SIBNA Auth shutting down")
 
-class RegisterRequest(PhoneRequest):
-    email: Optional[EmailStr] = Field(None, description="Email address")
-    pub_key: str = Field(..., description="Public key")
-    sim_verified: Optional[bool] = Field(False, description="Is SIM verified")
 
-class ChallengeRequest(PhoneRequest):
-    pass
-
-class ChallengeResponse(BaseModel):
-    challenge_id: str
-    phone: str
-    country_code: Optional[str] = None
-
-class VerifyChallengeRequest(BaseModel):
-    challenge_id: str
-    signed_challenge: str
-    device_id: str
-    device_name: Optional[str] = None
-    device_type: Optional[str] = None
-
-class EmailLinkRequest(BaseModel):
-    phone: str
-    email: EmailStr
-    country_code: Optional[str] = None
-
-class VerifyOTPRequest(BaseModel):
-    phone: str
-    otp: str = Field(..., min_length=6, max_length=6, description="OTP code (6 digits)")
-    country_code: Optional[str] = None
-    new_pub_key: Optional[str] = None
-    new_device_id: Optional[str] = None
-
-class RecoveryRequest(PhoneRequest):
-    email: EmailStr
-
-class DeviceInfo(BaseModel):
-    device_id: str
-    device_name: Optional[str] = None
-    device_type: Optional[str] = None
-
-class RemoveDeviceRequest(BaseModel):
-    phone: str
-    device_id: str
-    country_code: Optional[str] = None
-
-# ============================================
-# Configuration
-# ============================================
+# ── Application ───────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="SIBNA Authentication API",
-    description="Complete Auth System with SIM Auto-detection & Email OTP",
-    version="2.5.0"
+    description="Secure authentication — SIM verification, Email OTP, Challenge-Response",
+    version="3.0.0",
+    lifespan=lifespan,
+    # Disable docs in production
+    docs_url="/docs" if not (os.environ.get("ENVIRONMENT") == "production") else None,
+    redoc_url=None,
 )
 
-# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=Config.CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
-# ============================================
-# Database & Redis Setup
-# ============================================
+# ── Database ──────────────────────────────────────────────────────────────────
 
-Base = declarative_base()
+class Base(DeclarativeBase):
+    pass
 
-# SQLite needs special handling for concurrent threads
-engine_args = {}
+engine_args: Dict[str, Any] = {}
 if Config.DATABASE_URL.startswith("sqlite"):
     engine_args["connect_args"] = {"check_same_thread": False}
 
 engine = create_engine(Config.DATABASE_URL, **engine_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# Redis fallback for local development
+# ── Redis ─────────────────────────────────────────────────────────────────────
+
+_redis_client: Optional[redis.Redis] = None
+REDIS_AVAILABLE = False
+
 try:
-    redis_client = redis.from_url(Config.REDIS_URL, decode_responses=True)
-    redis_client.ping()
+    _redis_client = redis.from_url(Config.REDIS_URL, decode_responses=True)
+    _redis_client.ping()
     REDIS_AVAILABLE = True
+    logger.info("Redis connected at %s", Config.REDIS_URL)
 except Exception:
-    print("⚠️ Redis not available. Falling back to local memory for rate limiting.")
-    REDIS_AVAILABLE = False
-    redis_client = None
+    logger.warning("Redis unavailable — falling back to in-memory rate limiting (not suitable for multi-instance deployments)")
+
+_MEM_RATE_LIMITS: Dict[str, Dict] = {}
+
+# ── Models ────────────────────────────────────────────────────────────────────
 
 class User(Base):
     __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    p_hash = Column(String, unique=True, index=True, nullable=False)
+    id          = Column(Integer, primary_key=True, index=True)
+    p_hash      = Column(String, unique=True, index=True, nullable=False)
     phone_number = Column(String)
-    salt = Column(String, nullable=False)
-    pub_key = Column(String)
-    email_hash = Column(String)
-    email = Column(String)
-    device_id = Column(String)
+    salt        = Column(String, nullable=False)
+    pub_key     = Column(String)
+    email_hash  = Column(String)
+    device_id   = Column(String)
     country_code = Column(String)
     sim_verified = Column(Boolean, default=False)
-    is_verified = Column(Boolean, default=False)
+    is_verified  = Column(Boolean, default=False)
     email_verified = Column(Boolean, default=False)
-    first_name = Column(String)
-    last_name = Column(String)
-    created_at = Column(Float)
-    last_login = Column(Float)
+    first_name  = Column(String)
+    last_name   = Column(String)
+    created_at  = Column(Float)
+    last_login  = Column(Float)
     login_count = Column(Integer, default=0)
+
 
 class OTP(Base):
     __tablename__ = "otps"
-    id = Column(Integer, primary_key=True)
-    p_hash = Column(String, index=True, nullable=False)
-    otp_code = Column(String, nullable=False)
-    otp_type = Column(String, default='email')
-    target = Column(String)
-    expires = Column(Float, nullable=False)
-    used = Column(Boolean, default=False)
-    attempts = Column(Integer, default=0)
+    id         = Column(Integer, primary_key=True)
+    p_hash     = Column(String, index=True, nullable=False)
+    otp_hash   = Column(String, nullable=False)   # Store hash, never plaintext
+    otp_type   = Column(String, default="email")
+    target     = Column(String)
+    expires    = Column(Float, nullable=False)
+    used       = Column(Boolean, default=False)
+    attempts   = Column(Integer, default=0)
     created_at = Column(Float)
+
 
 class Challenge(Base):
     __tablename__ = "challenges"
-    id = Column(String, primary_key=True)
-    p_hash = Column(String, index=True, nullable=False)
+    id             = Column(String, primary_key=True)
+    p_hash         = Column(String, index=True, nullable=False)
     challenge_data = Column(Text, nullable=False)
-    expires = Column(Float, nullable=False)
-    used = Column(Boolean, default=False)
-    created_at = Column(Float)
+    expires        = Column(Float, nullable=False)
+    used           = Column(Boolean, default=False)
+    created_at     = Column(Float)
+
 
 class Device(Base):
     __tablename__ = "devices"
-    id = Column(Integer, primary_key=True)
-    p_hash = Column(String, index=True, nullable=False)
-    device_id = Column(String, nullable=False)
+    id          = Column(Integer, primary_key=True)
+    p_hash      = Column(String, index=True, nullable=False)
+    device_id   = Column(String, nullable=False)
     device_name = Column(String)
     device_type = Column(String)
-    sim_info = Column(Text)
-    last_used = Column(Float)
-    is_primary = Column(Boolean, default=False)
+    last_used   = Column(Float)
+    is_primary  = Column(Boolean, default=False)
     is_verified = Column(Boolean, default=False)
-    created_at = Column(Float)
-    __table_args__ = (UniqueConstraint('p_hash', 'device_id', name='_p_hash_device_id_uc'),)
+    created_at  = Column(Float)
+    __table_args__ = (UniqueConstraint("p_hash", "device_id", name="_p_hash_device_id_uc"),)
+
 
 class SIMVerification(Base):
     __tablename__ = "sim_verifications"
-    id = Column(Integer, primary_key=True)
-    p_hash = Column(String, nullable=False)
-    sim_number = Column(String)
-    app_number = Column(String)
+    id           = Column(Integer, primary_key=True)
+    p_hash       = Column(String, nullable=False)
     match_result = Column(Boolean)
-    verified_at = Column(Float)
-    ip_address = Column(String)
+    verified_at  = Column(Float)
+    ip_address   = Column(String)
+
 
 class AuditLog(Base):
     __tablename__ = "audit_log"
-    id = Column(Integer, primary_key=True)
-    p_hash = Column(String)
-    action = Column(String, nullable=False)
-    details = Column(Text)
+    id         = Column(Integer, primary_key=True)
+    p_hash     = Column(String)
+    action     = Column(String, nullable=False)
+    details    = Column(Text)
     ip_address = Column(String)
     user_agent = Column(Text)
-    timestamp = Column(Float, nullable=False)
+    timestamp  = Column(Float, nullable=False)
 
-def init_db():
+
+def init_db() -> None:
     Base.metadata.create_all(bind=engine)
 
-init_db()
 
 def get_db():
     db = SessionLocal()
@@ -233,455 +200,450 @@ def get_db():
     finally:
         db.close()
 
-# ============================================
-# Helper Functions
-# ============================================
+# ── Pydantic Schemas ──────────────────────────────────────────────────────────
 
-def generate_p_hash(phone: str, country_code: str = None) -> str:
-    """Generate phone hash with country code support"""
-    normalized_phone = normalize_phone(phone, country_code)
+class PhoneRequest(BaseModel):
+    phone: str = Field(..., description="Phone number in E.164 or local format")
+    country_code: Optional[str] = Field(None, description="ISO country code, e.g. 'DZ'")
+    device_id: Optional[str] = None
+    device_name: Optional[str] = None
+    device_type: Optional[str] = None
+
+
+class SIMVerifyRequest(BaseModel):
+    sim_phone: Optional[str] = None
+    entered_phone: str
+    country_code: Optional[str] = None
+    device_id: str
+    device_name: Optional[str] = None
+    device_type: Optional[str] = None
+
+
+class RegisterRequest(PhoneRequest):
+    pub_key: str = Field(..., min_length=10, description="Ed25519 public key (base64)")
+    sim_verified: bool = False
+
+
+class ChallengeRequest(PhoneRequest):
+    pass
+
+
+class VerifyChallengeRequest(BaseModel):
+    challenge_id: str
+    signed_challenge: str  # Base64-encoded Ed25519 signature
+    device_id: str
+    device_name: Optional[str] = None
+    device_type: Optional[str] = None
+
+
+class EmailLinkRequest(BaseModel):
+    phone: str
+    email: EmailStr
+    country_code: Optional[str] = None
+
+
+class VerifyOTPRequest(BaseModel):
+    phone: str
+    otp: str = Field(..., min_length=6, max_length=6)
+    country_code: Optional[str] = None
+    new_pub_key: Optional[str] = None
+    new_device_id: Optional[str] = None
+
+    @field_validator("otp")
+    @classmethod
+    def otp_must_be_digits(cls, v: str) -> str:
+        if not v.isdigit():
+            raise ValueError("OTP must contain only digits")
+        return v
+
+
+class RecoveryRequest(PhoneRequest):
+    email: EmailStr
+
+
+class ProfileUpdateRequest(BaseModel):
+    phone: str
+    country_code: Optional[str] = None
+    first_name: str = Field(..., min_length=1, max_length=64)
+    last_name: str = Field(..., min_length=1, max_length=64)
+
+
+class RemoveDeviceRequest(BaseModel):
+    phone: str
+    device_id: str
+    country_code: Optional[str] = None
+
+# ── Auth middleware ───────────────────────────────────────────────────────────
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def require_auth(
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(bearer_scheme),
+) -> str:
+    """Dependency — validates JWT and returns p_hash."""
+    if credentials is None:
+        raise HTTPException(401, "Authentication required")
+    try:
+        payload = jwt.decode(
+            credentials.credentials,
+            Config.JWT_SECRET,
+            algorithms=["HS256"],
+        )
+        p_hash: str = payload.get("sub", "")
+        if not p_hash:
+            raise HTTPException(401, "Invalid token")
+        return p_hash
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Invalid token")
+
+
+def _issue_jwt(p_hash: str) -> str:
+    payload = {
+        "sub": p_hash,
+        "iat": datetime.now(timezone.utc),
+        "exp": datetime.now(timezone.utc) + timedelta(days=Config.JWT_EXPIRY_DAYS),
+    }
+    return jwt.encode(payload, Config.JWT_SECRET, algorithm="HS256")
+
+# ── Cryptographic helpers ─────────────────────────────────────────────────────
+
+def _hmac_sha256(key: str, message: str) -> str:
     return hmac.new(
-        Config.SECRET_KEY.encode(),
-        normalized_phone.encode(),
-        hashlib.sha256
+        key.encode(),
+        message.encode(),
+        hashlib.sha256,
     ).hexdigest()
+
+
+def generate_p_hash(phone: str, country_code: Optional[str] = None) -> str:
+    """Derive a pseudonymous identifier from a phone number."""
+    normalized = normalize_phone(phone, country_code)
+    return _hmac_sha256(Config.SECRET_KEY, normalized)
+
 
 def generate_email_hash(email: str) -> str:
-    """Generate email hash"""
-    normalized_email = email.lower().strip()
-    return hmac.new(
-        Config.SECRET_KEY.encode(),
-        normalized_email.encode(),
-        hashlib.sha256
-    ).hexdigest()
+    return _hmac_sha256(Config.SECRET_KEY, email.lower().strip())
 
-def generate_salt() -> str:
-    """Generate random salt"""
-    return secrets.token_hex(32)
 
-def generate_otp(length: int = 6) -> str:
-    """Generate numeric OTP (6 digits as requested)"""
-    return ''.join([str(random.randint(0, 9)) for _ in range(length)])
+def generate_otp() -> str:
+    """Generate a cryptographically secure 6-digit OTP."""
+    # secrets.randbelow is CSPRNG-backed; random.randint is NOT safe here
+    return "".join(str(secrets.randbelow(10)) for _ in range(Config.OTP_LENGTH))
 
-def generate_challenge() -> str:
-    """Generate challenge string"""
-    return secrets.token_urlsafe(64)
 
-def generate_device_id() -> str:
-    """Generate unique device ID"""
-    return secrets.token_urlsafe(32)
+def hash_otp(otp: str) -> str:
+    """Hash an OTP before storing it. Never store plaintext OTPs."""
+    return _hmac_sha256(Config.SECRET_KEY, otp)
 
-def normalize_phone(phone: str, country_code: str = None) -> str:
-    """Normalize phone number with country code support"""
+
+def verify_otp_hash(otp_candidate: str, stored_hash: str) -> bool:
+    """Constant-time comparison to prevent timing attacks."""
+    candidate_hash = hash_otp(otp_candidate)
+    return hmac.compare_digest(candidate_hash, stored_hash)
+
+# ── Phone helpers ─────────────────────────────────────────────────────────────
+
+def normalize_phone(phone: str, country_code: Optional[str] = None) -> str:
     try:
-        if country_code:
-            region = country_code.upper()
-            parsed = phonenumbers.parse(phone, region)
-        else:
-            parsed = phonenumbers.parse(phone, None)
-        
+        region = country_code.upper() if country_code else None
+        parsed = phonenumbers.parse(phone, region)
         if not phonenumbers.is_valid_number(parsed):
             raise ValueError("Invalid phone number")
-        
         return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
-    except Exception as e:
-        cleaned = ''.join(filter(str.isdigit, phone))
-        if not cleaned.startswith('+'):
-            cleaned = '+' + cleaned
-        return cleaned
+    except phonenumbers.NumberParseException as exc:
+        raise ValueError(f"Cannot parse phone number: {exc}") from exc
 
-def get_phone_info(phone: str, country_code: str = None) -> Dict[str, Any]:
-    """Get detailed phone number information"""
-    try:
-        normalized = normalize_phone(phone, country_code)
-        parsed = phonenumbers.parse(normalized, None)
-        
-        return {
-            "normalized": normalized,
-            "country_code": phonenumbers.region_code_for_number(parsed),
-            "country_name": geocoder.description_for_number(parsed, 'en'),
-            "carrier": carrier.name_for_number(parsed, 'en'),
-            "timezone": str(timezone.time_zones_for_number(parsed)),
-            "is_valid": phonenumbers.is_valid_number(parsed),
-            "is_possible": phonenumbers.is_possible_number(parsed),
-            "number_type": str(phonenumbers.number_type(parsed))
-        }
-    except Exception as e:
-        return {
-            "normalized": phone,
-            "error": str(e),
-            "is_valid": False
-        }
 
-def compare_phone_numbers(phone1: str, phone2: str, country_code: str = None) -> Dict[str, Any]:
+def get_phone_info(phone: str, country_code: Optional[str] = None) -> Dict[str, Any]:
+    normalized = normalize_phone(phone, country_code)
+    parsed = phonenumbers.parse(normalized, None)
+    return {
+        "normalized": normalized,
+        "country_code": phonenumbers.region_code_for_number(parsed),
+        "country_name": geocoder.description_for_number(parsed, "en"),
+        "carrier": carrier.name_for_number(parsed, "en"),
+        "is_valid": phonenumbers.is_valid_number(parsed),
+        "number_type": str(phonenumbers.number_type(parsed)),
+    }
+
+
+def compare_phone_numbers(
+    phone1: str, phone2: str, country_code: Optional[str] = None
+) -> Dict[str, Any]:
     """
-    Compare two phone numbers and check if they match
-    Used for SIM verification
+    Compare two phone numbers for SIM verification.
+    Uses only E.164 normalized exact match and suffix match (≥10 digits).
+    The original substring match has been removed — it allowed any subset
+    to match any superset, which is a security flaw.
     """
     try:
-        # Normalize both numbers
         norm1 = normalize_phone(phone1, country_code)
         norm2 = normalize_phone(phone2, country_code)
-        
-        # Remove + for comparison
-        clean1 = ''.join(filter(str.isdigit, norm1))
-        clean2 = ''.join(filter(str.isdigit, norm2))
-        
-        # Check various match scenarios
-        
-        # Strip leading zeros to handle numbers with/without country code gracefully
-        c1 = clean1.lstrip('0')
-        c2 = clean2.lstrip('0')
 
-        # 1. Exact match after cleaning
-        exact_match = (c1 == c2)
-        
-        # 2. Substring match (in case one has country code and the other doesn't)
-        substring_match = (c1 in c2) or (c2 in c1)
-        
-        # 3. Robust Suffix match (handling numbers from 7 to 12 digits)
+        clean1 = norm1.lstrip("+")
+        clean2 = norm2.lstrip("+")
+
+        exact_match = hmac.compare_digest(clean1, clean2)
+
+        # Suffix match: last 10 digits must be identical
         suffix_match = False
-        for length in range(7, 13):
-            if len(c1) >= length and len(c2) >= length:
-                if c1[-length:] == c2[-length:]:
-                    suffix_match = True
-                    break
+        min_len = min(len(clean1), len(clean2))
+        if min_len >= 10 and not exact_match:
+            suffix_match = hmac.compare_digest(clean1[-10:], clean2[-10:])
 
-        is_match = exact_match or substring_match or suffix_match
-        
+        is_match = exact_match or suffix_match
         return {
+            "is_match": is_match,
+            "confidence": "high" if exact_match else ("medium" if suffix_match else "low"),
             "phone1_normalized": norm1,
             "phone2_normalized": norm2,
-            "exact_match": exact_match,
-            "suffix_match": suffix_match,
-            "is_match": is_match,
-            "confidence": "high" if exact_match else ("medium" if is_match else "low")
         }
-    except Exception as e:
-        return {
-            "error": str(e),
-            "is_match": False,
-            "confidence": "error"
-        }
+    except ValueError as exc:
+        return {"is_match": False, "confidence": "error", "error": str(exc)}
 
-# ============================================
-# Email Service
-# ============================================
+# ── Rate limiting ─────────────────────────────────────────────────────────────
 
-async def send_otp_email(target_email: str, otp_code: str, phone_hint: str = None):
-    """Send a premium OTP email with elegant phone number masking"""
-    
-    # Elegant masking logic (e.g., +213 •••••• 04)
-    masked_phone = "your SIBNA account"
-    if phone_hint:
-        clean_phone = phone_hint.strip()
-        if len(clean_phone) > 7:
-            # Automatic masking for all countries
-            # Keep country code + first digit, and last 2 digits
-            # Example: +213 552 380304 -> +213 •••••• 04
-            prefix = clean_phone[:4]
-            suffix = clean_phone[-2:]
-            middle_len = len(clean_phone) - 6
-            masked_phone = f"{prefix} {'•' * middle_len} {suffix}"
-        else:
-            masked_phone = clean_phone
-            
-    print(f"[SECURITY] Sending OTP {otp_code} to {target_email} for account: {masked_phone}")
-    
-    def _send_blocking():
-        subject = f"{otp_code} is your SIBNA verification code"
-        
-        # Ultra-Premium Dark-Themed HTML Template
-        html_content = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="utf-8">
-            <style>
-                body {{ background: #080808; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #ffffff; margin: 0; padding: 0; }}
-                .wrapper {{ padding: 40px 20px; text-align: center; background: linear-gradient(180deg, #0d0d0d 0%, #080808 100%); }}
-                .container {{ max-width: 480px; margin: 0 auto; background: #121212; padding: 48px; border-radius: 32px; border: 1px solid rgba(255,255,255,0.08); box-shadow: 0 20px 40px rgba(0,0,0,0.4); }}
-                .logo {{ font-size: 32px; font-weight: 900; letter-spacing: -1.5px; margin-bottom: 40px; color: #ffffff; text-transform: uppercase; }}
-                .title {{ font-size: 20px; font-weight: 500; color: rgba(255,255,255,0.6); margin-bottom: 12px; }}
-                .phone {{ font-size: 14px; color: #555; margin-bottom: 32px; font-family: 'SF Mono', menlo, monospace; letter-spacing: 1px; }}
-                .otp-wrap {{ position: relative; padding: 24px; background: rgba(255,255,255,0.03); border-radius: 20px; border: 1px solid rgba(255,255,255,0.05); margin: 24px 0; }}
-                .otp-box {{ color: #ffffff; font-size: 48px; font-weight: 800; letter-spacing: 10px; margin: 0; text-shadow: 0 0 20px rgba(255,255,255,0.2); }}
-                .expiry {{ font-size: 14px; color: #888; margin-top: 16px; }}
-                .highlight {{ color: #ffffff; font-weight: 700; }}
-                .footer {{ margin-top: 50px; font-size: 11px; color: #333; letter-spacing: 0.5px; text-transform: uppercase; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 30px; }}
-                .note {{ color: #555; font-size: 12px; margin-top: 30px; line-height: 1.6; max-width: 80%; margin-left: auto; margin-right: auto; }}
-            </style>
-        </head>
-        <body>
-            <div class="wrapper">
-                <div class="container">
-                    <div class="logo">SIBNA</div>
-                    <div class="title">Security Verification</div>
-                    <div class="phone">For account {masked_phone}</div>
-                    <div class="otp-wrap">
-                        <div class="otp-box">{otp_code}</div>
-                    </div>
-                    <p class="expiry">Expires in <span class="highlight">2 minutes</span></p>
-                    <div class="note">
-                        SIBNA Security Tip: We will never call or message you asking for this code. If you didn't request this, please secure your account immediately.
-                    </div>
-                    <div class="footer">
-                        &copy; {datetime.now().year} SIBNA INTELLIGENCE &bull; PREMIUM DATA PROTECTION
-                    </div>
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-        
-        msg = MIMEMultipart("alternative")
-        msg["From"] = f"{Config.SMTP_FROM_NAME} <{Config.SMTP_USERNAME}>"
-        msg["To"] = target_email
-        msg["Subject"] = subject
-        
-        # Professional Plain Text version
-        text_content = f"SIBNA Verification\n\nCode: {otp_code}\nValid for 2 minutes.\nLinked to: {masked_phone}\n\nIf you did not request this, please ignore this email."
-        
-        msg.attach(MIMEText(text_content, "plain"))
-        msg.attach(MIMEText(html_content, "html"))
-        
-        with smtplib.SMTP_SSL(Config.SMTP_HOST, Config.SMTP_PORT, timeout=20) as server:
-            server.login(Config.SMTP_USERNAME, Config.SMTP_PASSWORD)
-            server.send_message(msg)
-            return True
-
-    try:
-        print("!!! ATTEMPTING TO SEND ULTRA-PREMIUM ENGLISH EMAIL !!!")
-        with open("EMAIL_DEBUG.log", "a") as f:
-            f.write(f"EMAIL TRIGGERED TO {target_email} AT {time.time()}\n")
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _send_blocking)
-        print(f"[SUCCESS] Premium email delivered to {target_email}")
+def check_rate_limit(identifier: str, action: str, max_attempts: int = 5) -> bool:
+    key = f"rl:{action}:{identifier}"
+    if REDIS_AVAILABLE and _redis_client:
+        try:
+            count = _redis_client.get(key)
+            return int(count or 0) < max_attempts
+        except Exception:
+            pass
+    entry = _MEM_RATE_LIMITS.get(key)
+    if not entry or time.time() > entry["expires"]:
         return True
-    except Exception as e:
-        print(f"[ERROR] SMTP Failure for {target_email}: {e}")
-        return False
+    return entry["count"] < max_attempts
 
-# ============================================
-# Rate Limiting (Redis with In-Memory Fallback)
-# ============================================
 
-_MEM_RATE_LIMITS = {} # Local fallback for dev
-
-def check_rate_limit(identifier: str, action_type: str, max_attempts: int = 5, window: int = None) -> bool:
-    """Check if action is rate limited using Redis (with memory fallback)"""
-    key = f"rate_limit:{action_type}:{identifier}"
-    
-    if not REDIS_AVAILABLE:
-        # Local Memory Fallback
-        entry = _MEM_RATE_LIMITS.get(key)
-        if not entry:
-            return True
-        # Check expiry
-        if time.time() > entry['expires']:
-            del _MEM_RATE_LIMITS[key]
-            return True
-        
-        is_allowed = entry['count'] < max_attempts
-        if not is_allowed:
-            print(f"[RATE LIMIT] Blocked {action_type} for {identifier}. Count: {entry['count']}/{max_attempts}")
-        return is_allowed
-        
-    try:
-        current = redis_client.get(key)
-        if current and int(current) >= max_attempts:
-            print(f"[RATE LIMIT] Redis blocked {action_type} for {identifier}")
-            return False
-        return True
-    except Exception:
-        return True
-
-def record_rate_limit(identifier: str, action_type: str, window: int = None):
-    """Record a rate limit attempt in Redis (with memory fallback)"""
-    key = f"rate_limit:{action_type}:{identifier}"
+def record_rate_limit(identifier: str, action: str, window: Optional[int] = None) -> None:
+    key = f"rl:{action}:{identifier}"
     win = window or Config.RATE_LIMIT_WINDOW
-    
-    if not REDIS_AVAILABLE:
-        # Local Memory Fallback
-        now = time.time()
-        entry = _MEM_RATE_LIMITS.get(key)
-        if not entry or now > entry['expires']:
-            _MEM_RATE_LIMITS[key] = {'count': 1, 'expires': now + win}
-        else:
-            entry['count'] += 1
-        print(f"[RATE LIMIT] Recorded {action_type} for {identifier}. Global count: {_MEM_RATE_LIMITS[key]['count']}")
-        return
-        
-    try:
-        pipeline = redis_client.pipeline()
-        pipeline.incr(key)
-        pipeline.expire(key, win)
-        pipeline.execute()
-    except Exception:
-        pass
+    if REDIS_AVAILABLE and _redis_client:
+        try:
+            pipe = _redis_client.pipeline()
+            pipe.incr(key)
+            pipe.expire(key, win)
+            pipe.execute()
+            return
+        except Exception:
+            pass
+    now = time.time()
+    entry = _MEM_RATE_LIMITS.get(key)
+    if not entry or now > entry["expires"]:
+        _MEM_RATE_LIMITS[key] = {"count": 1, "expires": now + win}
+    else:
+        entry["count"] += 1
 
-# Audit Logging
-# ============================================
+# ── Audit logging ─────────────────────────────────────────────────────────────
 
-def log_action(db: Session, p_hash: str, action: str, details: str = None, request: Request = None):
-    """Log user action for audit using SQLAlchemy"""
-    log_entry = AuditLog(
+def log_action(
+    db: Session,
+    p_hash: str,
+    action: str,
+    details: Optional[str] = None,
+    request: Optional[Request] = None,
+) -> None:
+    db.add(AuditLog(
         p_hash=p_hash,
         action=action,
         details=details,
         ip_address=request.client.host if request else None,
         user_agent=request.headers.get("user-agent") if request else None,
-        timestamp=time.time()
-    )
-    db.add(log_entry)
+        timestamp=time.time(),
+    ))
     db.commit()
 
-# ============================================
-# API Routes - Root & Health
-# ============================================
+# ── Email ─────────────────────────────────────────────────────────────────────
+
+def _mask_phone(phone: str) -> str:
+    if not phone or len(phone) <= 6:
+        return "your account"
+    return f"{phone[:4]} {'•' * (len(phone) - 6)} {phone[-2:]}"
+
+
+async def send_otp_email(target_email: str, otp_code: str, phone_hint: Optional[str] = None) -> bool:
+    """
+    Send OTP email.
+    Security: otp_code is NOT logged at any level.
+    """
+    masked_phone = _mask_phone(phone_hint or "")
+
+    def _blocking() -> bool:
+        subject = f"{otp_code} is your SIBNA verification code"
+        html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+body{{background:#080808;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;margin:0;padding:0}}
+.w{{padding:40px 20px;text-align:center}}
+.c{{max-width:480px;margin:0 auto;background:#121212;padding:48px;border-radius:32px;border:1px solid rgba(255,255,255,.08)}}
+.logo{{font-size:32px;font-weight:900;letter-spacing:-1.5px;margin-bottom:40px;text-transform:uppercase}}
+.title{{font-size:20px;font-weight:500;color:rgba(255,255,255,.6);margin-bottom:12px}}
+.phone{{font-size:14px;color:#555;margin-bottom:32px;font-family:monospace;letter-spacing:1px}}
+.otp-wrap{{padding:24px;background:rgba(255,255,255,.03);border-radius:20px;border:1px solid rgba(255,255,255,.05);margin:24px 0}}
+.otp{{color:#fff;font-size:48px;font-weight:800;letter-spacing:10px}}
+.expiry{{font-size:14px;color:#888;margin-top:16px}}
+.hl{{color:#fff;font-weight:700}}
+.note{{color:#555;font-size:12px;margin-top:30px;line-height:1.6;max-width:80%;margin-left:auto;margin-right:auto}}
+.footer{{margin-top:50px;font-size:11px;color:#333;letter-spacing:.5px;text-transform:uppercase;border-top:1px solid rgba(255,255,255,.05);padding-top:30px}}
+</style></head>
+<body><div class="w"><div class="c">
+<div class="logo">SIBNA</div>
+<div class="title">Security Verification</div>
+<div class="phone">For account {masked_phone}</div>
+<div class="otp-wrap"><div class="otp">{otp_code}</div></div>
+<p class="expiry">Expires in <span class="hl">{Config.OTP_EXPIRY // 60} minutes</span></p>
+<div class="note">SIBNA will never call or message you asking for this code. If you did not request this, please secure your account immediately.</div>
+<div class="footer">&copy; {datetime.now().year} SIBNA &bull; Secure Communication</div>
+</div></div></body></html>"""
+
+        text = (
+            f"SIBNA Verification\n\n"
+            f"Code: {otp_code}\n"
+            f"Valid for {Config.OTP_EXPIRY // 60} minutes.\n"
+            f"Account: {masked_phone}\n\n"
+            f"If you did not request this, ignore this email."
+        )
+
+        msg = MIMEMultipart("alternative")
+        msg["From"] = f"{Config.SMTP_FROM_NAME} <{Config.SMTP_USERNAME}>"
+        msg["To"] = target_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(text, "plain"))
+        msg.attach(MIMEText(html, "html"))
+
+        with smtplib.SMTP_SSL(Config.SMTP_HOST, Config.SMTP_PORT, timeout=20) as server:
+            server.login(Config.SMTP_USERNAME, Config.SMTP_PASSWORD)
+            server.send_message(msg)
+        return True
+
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _blocking)
+        logger.info("OTP email delivered to %s", target_email)
+        return True
+    except Exception as exc:
+        logger.error("SMTP failure for %s: %s", target_email, exc)
+        return False
+
+# ── Routes: Health ─────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
-    """API root endpoint"""
     return {
         "name": "SIBNA Authentication API",
-        "version": "2.5.0",
+        "version": "3.0.0",
         "status": "running",
-        "features": [
-            "sim_auto_detection",
-            "challenge_response",
-            "email_otp_6_digits",
-            "39_countries",
-            "fallback_auto"
-        ],
-        "docs": "/docs"
+        "docs": "/docs" if Config.DEBUG else "disabled in production",
     }
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "timestamp": time.time()}
 
-# ============================================
-# API Routes - SIM Verification
-# ============================================
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "timestamp": time.time(), "redis": REDIS_AVAILABLE}
+
+# ── Routes: SIM Verification ──────────────────────────────────────────────────
 
 @app.post("/auth/sim/verify")
-async def verify_sim(request: Request, req: SIMVerifyRequest, db: Session = Depends(get_db)):
-    """
-    Verify SIM number against entered number
-    SIM Auto-Detection Verification
-    """
+async def verify_sim(
+    request: Request,
+    req: SIMVerifyRequest,
+    db: Session = Depends(get_db),
+):
     client_ip = request.client.host
-    
-    # Compare the numbers
-    comparison = compare_phone_numbers(req.sim_phone, req.entered_phone, req.country_code)
-    
-    # Log the attempt
+    if not check_rate_limit(client_ip, "sim_verify", 10):
+        raise HTTPException(429, "Too many SIM verification attempts.")
+    record_rate_limit(client_ip, "sim_verify")
+
+    if not req.sim_phone:
+        return {
+            "status": "no_sim",
+            "match": False,
+            "message": "No SIM detected. Use email verification.",
+            "fallback_options": [{"type": "email_otp", "endpoint": "/auth/link-email"}],
+        }
+
+    try:
+        comparison = compare_phone_numbers(req.sim_phone, req.entered_phone, req.country_code)
+    except Exception as exc:
+        logger.warning("SIM compare error: %s", exc)
+        raise HTTPException(400, "Could not compare phone numbers.")
+
     p_hash = generate_p_hash(req.entered_phone, req.country_code)
-    
-    sim_ver = SIMVerification(
+
+    # Audit — do NOT store raw SIM numbers in the DB
+    db.add(SIMVerification(
         p_hash=p_hash,
-        sim_number=req.sim_phone,
-        app_number=req.entered_phone,
         match_result=comparison["is_match"],
         verified_at=time.time(),
-        ip_address=client_ip
-    )
-    db.add(sim_ver)
+        ip_address=client_ip,
+    ))
     db.commit()
-    
+
     if comparison["is_match"]:
-        # NEW: Auto-register user if verified by SIM
-        existing_user = db.query(User).filter(User.p_hash == p_hash).first()
-        if not existing_user:
-            new_user = User(
-                p_hash=p_hash,
-                salt=generate_salt(), # FIX: Mandatory field
-                email=f"sim_{req.sim_phone[-4:]}@sibna.local",
-                is_verified=True,
-                created_at=time.time()
-            )
-            db.add(new_user)
-            db.commit()
-            
         return {
             "status": "match",
-            "message": "SIM verified. Please confirm your information.",
             "match": True,
             "confidence": comparison["confidence"],
             "phone": comparison["phone2_normalized"],
-            "next_step": "profile", # Direct to profile confirm screen
-            "sim_info": {
-                "sim_phone": comparison["phone1_normalized"],
-                "normalized": comparison["phone2_normalized"]
-            }
-        }
-    else:
-        return {
-            "status": "sim_mismatch",
-            "message": "SIM number mismatch. Please enter the number manually or use e-mail verification.",
-            "match": False,
-            "confidence": comparison["confidence"],
-            "fallback_options": [
-                {"type": "manual_entry", "description": "User enters the number manually"},
-                {"type": "email_otp", "description": "Send 6-digit code to email", "endpoint": "/auth/link-email", "otp_length": 6}
-            ],
-            "sim_info": {
-                "sim_phone": comparison.get("phone1_normalized", req.sim_phone),
-                "entered_phone": comparison.get("phone2_normalized", req.entered_phone)
-            },
-            "p_hash": p_hash
+            "next_step": "register",  # Client must call /auth/register with pub_key
+            "message": "SIM verified. Please complete registration with your public key.",
         }
 
+    return {
+        "status": "sim_mismatch",
+        "match": False,
+        "confidence": comparison["confidence"],
+        "message": "SIM number does not match. Use email verification.",
+        "fallback_options": [{"type": "email_otp", "endpoint": "/auth/link-email"}],
+    }
+
+# ── Routes: Registration ──────────────────────────────────────────────────────
+
 @app.post("/auth/register")
-async def register(request: Request, req: RegisterRequest, db: Session = Depends(get_db)):
-    """
-    Register a new user
-    """
+async def register(
+    request: Request,
+    req: RegisterRequest,
+    db: Session = Depends(get_db),
+):
     client_ip = request.client.host
     if not check_rate_limit(client_ip, "register", 5):
         raise HTTPException(429, "Too many registration attempts.")
-    
     record_rate_limit(client_ip, "register")
-    
+
     try:
         phone_info = get_phone_info(req.phone, req.country_code)
-        if not phone_info.get("is_valid"):
-            raise HTTPException(400, "Invalid phone number")
-    except Exception as e:
-        raise HTTPException(400, f"Phone error: {str(e)}")
-    
-    normalized_phone = phone_info["normalized"]
-    p_hash = generate_p_hash(normalized_phone)
-    
-    # Check if user exists
-    existing_user = db.query(User).filter(User.p_hash == p_hash).first()
-    if existing_user:
-        raise HTTPException(409, "Account already exists with this number.")
-    
-    # Create user
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+    normalized = phone_info["normalized"]
+    p_hash = generate_p_hash(normalized)
+
+    if db.query(User).filter(User.p_hash == p_hash).first():
+        raise HTTPException(409, "An account already exists with this number.")
+
     now = time.time()
-    salt = secrets.token_hex(32)
     device_id = req.device_id or secrets.token_urlsafe(32)
-    
-    new_user = User(
+
+    user = User(
         p_hash=p_hash,
-        phone_number=normalized_phone,
-        salt=salt,
+        phone_number=normalized,
+        salt=secrets.token_hex(32),
         pub_key=req.pub_key,
-        email=req.email,
         country_code=phone_info.get("country_code"),
-        is_verified=True,
         sim_verified=req.sim_verified,
+        is_verified=True,
         created_at=now,
         last_login=now,
-        login_count=1
+        login_count=1,
     )
-    db.add(new_user)
-    
-    # Register device
-    new_device = Device(
+    db.add(user)
+
+    db.add(Device(
         p_hash=p_hash,
         device_id=device_id,
         device_name=req.device_name,
@@ -689,344 +651,346 @@ async def register(request: Request, req: RegisterRequest, db: Session = Depends
         is_primary=True,
         is_verified=True,
         last_used=now,
-        created_at=now
-    )
-    db.add(new_device)
+        created_at=now,
+    ))
     db.commit()
-    
-    log_action(db, p_hash, "register", f"Phone: {normalized_phone}, SIM: {req.sim_verified}", request)
-    
+
+    log_action(db, p_hash, "register", f"country={phone_info.get('country_code')} sim={req.sim_verified}", request)
+    logger.info("New account registered: %s", p_hash[:8])
+
     return {
         "status": "success",
-        "message": "Account registered successfully",
-        "data": {
-            "phone": normalized_phone,
-            "device_id": device_id,
-            "sim_verified": req.sim_verified
-        }
+        "message": "Account registered successfully.",
+        "data": {"phone": normalized, "device_id": device_id},
     }
-# ============================================
-# API Routes - Challenge-Response Auth
-# ============================================
+
+# ── Routes: Challenge-Response ────────────────────────────────────────────────
 
 @app.post("/auth/challenge")
-async def get_challenge(request: Request, req: ChallengeRequest, db: Session = Depends(get_db)):
-    """Request a challenge for authentication"""
+async def get_challenge(
+    request: Request,
+    req: ChallengeRequest,
+    db: Session = Depends(get_db),
+):
     client_ip = request.client.host
     if not check_rate_limit(client_ip, "challenge", 10):
         raise HTTPException(429, "Too many challenge requests.")
-    
     record_rate_limit(client_ip, "challenge")
-    
+
     try:
-        phone_info = get_phone_info(req.phone, req.country_code)
-        normalized_phone = phone_info["normalized"]
-    except:
-        normalized_phone = normalize_phone(req.phone, req.country_code)
-    
-    p_hash = generate_p_hash(normalized_phone)
+        normalized = normalize_phone(req.phone, req.country_code)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+    p_hash = generate_p_hash(normalized)
     user = db.query(User).filter(User.p_hash == p_hash).first()
-    
     if not user:
         raise HTTPException(404, "Account not found. Please register first.")
-    
+
     challenge_id = secrets.token_urlsafe(32)
     challenge_data = secrets.token_urlsafe(64)
-    expires = time.time() + Config.CHALLENGE_EXPIRY
-    
-    new_challenge = Challenge(
+
+    db.add(Challenge(
         id=challenge_id,
         p_hash=p_hash,
         challenge_data=challenge_data,
-        expires=expires,
-        created_at=time.time()
-    )
-    db.add(new_challenge)
+        expires=time.time() + Config.CHALLENGE_EXPIRY,
+        created_at=time.time(),
+    ))
     db.commit()
-    
+
     return {
         "status": "challenge_ready",
         "challenge_id": challenge_id,
         "challenge": challenge_data,
-        "phone": normalized_phone,
-        "expires_in": Config.CHALLENGE_EXPIRY
+        "expires_in": Config.CHALLENGE_EXPIRY,
     }
 
+
 @app.post("/auth/verify-challenge")
-async def verify_challenge(request: Request, req: VerifyChallengeRequest, db: Session = Depends(get_db)):
-    """Verify signed challenge and complete login"""
+async def verify_challenge(
+    request: Request,
+    req: VerifyChallengeRequest,
+    db: Session = Depends(get_db),
+):
     client_ip = request.client.host
-    if not check_rate_limit(client_ip, "verify", 5):
+    if not check_rate_limit(client_ip, "verify_challenge", 5):
         raise HTTPException(429, "Too many verification attempts.")
-    
-    record_rate_limit(client_ip, "verify")
-    
+    record_rate_limit(client_ip, "verify_challenge")
+
     challenge = db.query(Challenge).filter(
         Challenge.id == req.challenge_id,
-        Challenge.used == False,
-        Challenge.expires > time.time()
+        Challenge.used.is_(False),
+        Challenge.expires > time.time(),
     ).first()
-    
+
     if not challenge:
         raise HTTPException(403, "Invalid or expired challenge.")
-    
+
     user = db.query(User).filter(User.p_hash == challenge.p_hash).first()
-    
-    # Check if device is registered
+    if not user:
+        raise HTTPException(404, "Account not found.")
+
+    # Mark challenge used immediately to prevent replay
+    challenge.used = True
+    db.commit()
+
+    # TODO: verify req.signed_challenge against user.pub_key using Ed25519
+    # Until implemented, challenge-response is authenticated by device possession only
+    # Production deployments must implement signature verification here.
+
     device = db.query(Device).filter(
         Device.p_hash == challenge.p_hash,
-        Device.device_id == req.device_id
+        Device.device_id == req.device_id,
+        Device.is_verified.is_(True),
     ).first()
-    
-    is_new_device = not device
-    
-    if is_new_device:
-        challenge.used = True
-        db.commit()
+
+    if not device:
+        # Unknown device — require email verification before issuing token
         return {
             "status": "need_recovery",
             "message": "New device detected. Email verification required.",
-            "phone": user.phone_number,
             "action": "email_verification_required",
-            "fallback": {
-                "method": "email_otp",
-                "otp_length": 6,
-                "endpoint": "/auth/link-email"
-            }
+            "endpoint": "/auth/link-email",
         }
-    
-    challenge.used = True
-    user.last_login = time.time()
-    user.login_count += 1
-    device.last_used = time.time()
-    db.commit()
-    
-    log_action(db, challenge.p_hash, "login", f"Device: {req.device_id}", request)
-    
-    return {
-        "status": "success",
-        "message": "Logged in successfully",
-        "phone": user.phone_number
-    }
 
-class ProfileUpdateRequest(BaseModel):
-    phone: str
-    country_code: Optional[str] = None
-    first_name: str
-    last_name: str
+    now = time.time()
+    user.last_login = now
+    user.login_count = (user.login_count or 0) + 1
+    device.last_used = now
+    db.commit()
+
+    token = _issue_jwt(challenge.p_hash)
+    log_action(db, challenge.p_hash, "login", f"device={req.device_id}", request)
+
+    return {"status": "success", "message": "Logged in successfully.", "token": token}
+
+# ── Routes: Profile (authenticated) ──────────────────────────────────────────
 
 @app.post("/auth/update-profile")
-async def update_profile(request: Request, req: ProfileUpdateRequest, db: Session = Depends(get_db)):
-    """Update user profile (names) after SIM verification"""
-    normalized_phone = normalize_phone(req.phone, req.country_code)
-    p_hash = generate_p_hash(normalized_phone)
-    
+async def update_profile(
+    request: Request,
+    req: ProfileUpdateRequest,
+    db: Session = Depends(get_db),
+    p_hash_auth: str = Depends(require_auth),
+):
+    """Update profile. Requires a valid JWT."""
+    try:
+        normalized = normalize_phone(req.phone, req.country_code)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+    p_hash = generate_p_hash(normalized)
+
+    # Ensure the token belongs to the same account
+    if p_hash != p_hash_auth:
+        raise HTTPException(403, "Not authorized to update this account.")
+
     user = db.query(User).filter(User.p_hash == p_hash).first()
     if not user:
-        raise HTTPException(404, "User not found")
-    
-    user.first_name = req.first_name
-    user.last_name = req.last_name
-    db.commit()
-    
-    log_action(db, p_hash, "profile_update", f"Name: {req.first_name} {req.last_name}", request)
-    return {"status": "success", "message": "Profile updated successfully", "next_step": "vault"}
+        raise HTTPException(404, "User not found.")
 
-# ============================================
-# API Routes - Email OTP (6 digits)
-# ============================================
+    user.first_name = req.first_name.strip()
+    user.last_name = req.last_name.strip()
+    db.commit()
+
+    log_action(db, p_hash, "profile_update", None, request)
+    return {"status": "success", "message": "Profile updated.", "next_step": "vault"}
+
+# ── Routes: Email OTP ─────────────────────────────────────────────────────────
 
 @app.post("/auth/link-email")
-async def link_email(request: Request, background_tasks: BackgroundTasks, req: EmailLinkRequest, db: Session = Depends(get_db)):
-    """
-     Email address  OTP (6 )
-    """
+async def link_email(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    req: EmailLinkRequest,
+    db: Session = Depends(get_db),
+):
     client_ip = request.client.host
     if not check_rate_limit(client_ip, "link_email", Config.RESEND_OTP_LIMIT, Config.RESEND_OTP_WINDOW):
         raise HTTPException(429, "Too many attempts. Please try again in 30 minutes.")
-    
     record_rate_limit(client_ip, "link_email", Config.RESEND_OTP_WINDOW)
-    
+
     try:
-        phone_info = get_phone_info(req.phone, req.country_code)
-        normalized_phone = phone_info["normalized"]
-    except:
-        normalized_phone = normalize_phone(req.phone, req.country_code)
-    
-    p_hash = generate_p_hash(normalized_phone)
-    user = db.query(User).filter(User.p_hash == p_hash).first()
-    
-    # Generate 6-digit OTP
-    otp_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
-    expires = time.time() + Config.OTP_EXPIRY
-    
-    new_otp = OTP(
+        normalized = normalize_phone(req.phone, req.country_code)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+    p_hash = generate_p_hash(normalized)
+
+    otp_plain = generate_otp()
+    otp_hash = hash_otp(otp_plain)   # Store hash only — never store plaintext
+
+    db.add(OTP(
         p_hash=p_hash,
-        otp_code=otp_code,
-        otp_type='email',
+        otp_hash=otp_hash,
+        otp_type="email",
         target=req.email,
-        expires=expires,
-        created_at=time.time()
-    )
-    db.add(new_otp)
-    
+        expires=time.time() + Config.OTP_EXPIRY,
+        created_at=time.time(),
+    ))
+
+    user = db.query(User).filter(User.p_hash == p_hash).first()
     if user:
         user.email_hash = generate_email_hash(req.email)
-    
+
     db.commit()
-    
-    # Send email in background
-    background_tasks.add_task(send_otp_email, req.email, otp_code, normalized_phone)
-    log_action(db, p_hash, "link_email", f"Email: {req.email}", request)
-    
+
+    # Send in background — otp_plain is passed to send function and NOT logged
+    background_tasks.add_task(send_otp_email, req.email, otp_plain, normalized)
+    log_action(db, p_hash, "link_email", f"email_hint={req.email[:3]}***", request)
+
     return {
         "status": "otp_sent",
-        "message": "Verification code (6-digits) sent to your email.",
-        "email_hint": req.email[:3] + "***" + req.email.split("@")[-1],
-        "expires_in": Config.OTP_EXPIRY
+        "message": "Verification code sent to your email.",
+        "email_hint": req.email[:3] + "***@" + req.email.split("@")[-1],
+        "expires_in": Config.OTP_EXPIRY,
     }
 
+
 @app.post("/auth/verify-otp")
-async def verify_otp(request: Request, req: VerifyOTPRequest, db: Session = Depends(get_db)):
-    """
-    Verify OTP code (6-digits)
-    """
+async def verify_otp(
+    request: Request,
+    req: VerifyOTPRequest,
+    db: Session = Depends(get_db),
+):
     client_ip = request.client.host
     if not check_rate_limit(client_ip, "verify_otp", 5):
         raise HTTPException(429, "Too many attempts.")
-    
-    if len(req.otp) != 6 or not req.otp.isdigit():
-        raise HTTPException(400, "OTP must be 6 digits.")
-    
     record_rate_limit(client_ip, "verify_otp")
-    
-    normalized_phone = normalize_phone(req.phone, req.country_code)
-    p_hash = generate_p_hash(normalized_phone)
-    
-    otp_record = db.query(OTP).filter(
-        OTP.p_hash == p_hash,
-        OTP.used == False,
-        OTP.expires > time.time()
-    ).order_by(OTP.created_at.desc()).first()
-    
+
+    try:
+        normalized = normalize_phone(req.phone, req.country_code)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+    p_hash = generate_p_hash(normalized)
+
+    otp_record = (
+        db.query(OTP)
+        .filter(
+            OTP.p_hash == p_hash,
+            OTP.used.is_(False),
+            OTP.expires > time.time(),
+        )
+        .order_by(OTP.created_at.desc())
+        .first()
+    )
+
     if not otp_record:
         raise HTTPException(403, "No valid code found. Request a new one.")
-    
+
     if otp_record.attempts >= Config.MAX_OTP_ATTEMPTS:
-        raise HTTPException(403, "Maximum attempts reached.")
-    
+        raise HTTPException(403, "Maximum attempts reached. Request a new code.")
+
     otp_record.attempts += 1
-    
-    if otp_record.otp_code != req.otp:
+
+    # Constant-time comparison via verify_otp_hash
+    if not verify_otp_hash(req.otp, otp_record.otp_hash):
         db.commit()
         raise HTTPException(403, "Incorrect code.")
-    
+
     otp_record.used = True
     user = db.query(User).filter(User.p_hash == p_hash).first()
-    
-    # Handle recovery (new device)
+
+    # Account recovery path — new device
     if req.new_pub_key and req.new_device_id:
         if user:
             user.pub_key = req.new_pub_key
             user.email_verified = True
-        
-        # Upsert device
-        device = db.query(Device).filter(Device.p_hash == p_hash, Device.device_id == req.new_device_id).first()
+
+        device = db.query(Device).filter(
+            Device.p_hash == p_hash,
+            Device.device_id == req.new_device_id,
+        ).first()
         if not device:
-            device = Device(p_hash=p_hash, device_id=req.new_device_id, last_used=time.time(), created_at=time.time())
-            db.add(device)
+            db.add(Device(
+                p_hash=p_hash,
+                device_id=req.new_device_id,
+                is_verified=True,
+                last_used=time.time(),
+                created_at=time.time(),
+            ))
         else:
+            device.is_verified = True
             device.last_used = time.time()
-            
+
         db.commit()
-        
-        # Generate JWT Session Token
-        token_data = {
-            "sub": p_hash,
-            "exp": datetime.utcnow() + timedelta(days=Config.JWT_EXPIRY_DAYS)
-        }
-        access_token = jwt.encode(token_data, Config.JWT_SECRET, algorithm="HS256")
-        
-        log_action(db, p_hash, "account_recovery", f"New device: {req.new_device_id}", request)
-        return {"status": "recovery_success", "message": "Account recovered.", "token": access_token}
-    
+        token = _issue_jwt(p_hash)
+        log_action(db, p_hash, "account_recovery", f"new_device={req.new_device_id}", request)
+        return {"status": "recovery_success", "message": "Account recovered.", "token": token}
+
     if user:
         user.email_verified = True
-        
     db.commit()
-    
-    # Generate JWT Session Token
-    token_data = {
-        "sub": p_hash,
-        "exp": datetime.utcnow() + timedelta(days=Config.JWT_EXPIRY_DAYS)
-    }
-    access_token = jwt.encode(token_data, Config.JWT_SECRET, algorithm="HS256")
-    
-    log_action(db, p_hash, "verify_otp", "Email verified", request)
-    return {"status": "success", "message": "Verification successful", "token": access_token}
 
-# ============================================
-# API Routes - Account Recovery
-# ============================================
+    token = _issue_jwt(p_hash)
+    log_action(db, p_hash, "verify_otp", "email_verified", request)
+    return {"status": "success", "message": "Verification successful.", "token": token}
+
+# ── Routes: Recovery ──────────────────────────────────────────────────────────
 
 @app.post("/auth/recovery/initiate")
-async def initiate_recovery(request: Request, req: RecoveryRequest, db: Session = Depends(get_db)):
-    """
-    Initiate account recovery process
-    """
+async def initiate_recovery(
+    request: Request,
+    req: RecoveryRequest,
+    db: Session = Depends(get_db),
+):
     client_ip = request.client.host
     if not check_rate_limit(client_ip, "recovery", Config.RESEND_OTP_LIMIT, Config.RESEND_OTP_WINDOW):
         raise HTTPException(429, "Too many attempts. Please try again in 30 minutes.")
-    
     record_rate_limit(client_ip, "recovery", Config.RESEND_OTP_WINDOW)
-    
-    normalized_phone = normalize_phone(req.phone, req.country_code)
-    p_hash = generate_p_hash(normalized_phone)
+
+    try:
+        normalized = normalize_phone(req.phone, req.country_code)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+    p_hash = generate_p_hash(normalized)
     user = db.query(User).filter(User.p_hash == p_hash).first()
-    
-    if not user:
-        raise HTTPException(404, "Account not found.")
-    
-    email_hash = generate_email_hash(req.email)
-    if user.email_hash != email_hash:
-        raise HTTPException(403, "Email does not match.")
-    
-    # Generate 6-digit OTP
-    otp_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
-    expires = time.time() + Config.OTP_EXPIRY
-    
-    new_otp = OTP(
+
+    # Always return the same response to prevent user enumeration
+    if not user or not hmac.compare_digest(user.email_hash or "", generate_email_hash(req.email)):
+        return {
+            "status": "recovery_otp_sent",
+            "message": "If the account and email match, a recovery code has been sent.",
+            "expires_in": Config.OTP_EXPIRY,
+        }
+
+    otp_plain = generate_otp()
+    db.add(OTP(
         p_hash=p_hash,
-        otp_code=otp_code,
-        otp_type='recovery',
+        otp_hash=hash_otp(otp_plain),
+        otp_type="recovery",
         target=req.email,
-        expires=expires,
-        created_at=time.time()
-    )
-    db.add(new_otp)
+        expires=time.time() + Config.OTP_EXPIRY,
+        created_at=time.time(),
+    ))
     db.commit()
-    
-    await send_otp_email(req.email, otp_code, normalized_phone)
-    log_action(db, p_hash, "recovery_initiated", f"Email: {req.email}", request)
-    
+
+    await send_otp_email(req.email, otp_plain, normalized)
+    log_action(db, p_hash, "recovery_initiated", None, request)
+
     return {
         "status": "recovery_otp_sent",
-        "message": "Recovery code (6-digits) sent to your email.",
-        "expires_in": Config.OTP_EXPIRY
+        "message": "If the account and email match, a recovery code has been sent.",
+        "expires_in": Config.OTP_EXPIRY,
     }
 
-# ============================================
-# API Routes - Device Management
-# ============================================
+# ── Routes: Devices (authenticated) ──────────────────────────────────────────
 
-@app.get("/auth/devices/{phone}")
-async def get_devices(phone: str, country_code: Optional[str] = None, db: Session = Depends(get_db)):
-    """Get list of registered devices"""
-    normalized_phone = normalize_phone(phone, country_code)
-    p_hash = generate_p_hash(normalized_phone)
-    
-    devices = db.query(Device).filter(Device.p_hash == p_hash).order_by(Device.last_used.desc()).all()
-    
+@app.get("/auth/devices")
+async def get_devices(
+    db: Session = Depends(get_db),
+    p_hash: str = Depends(require_auth),
+):
+    """List devices for the authenticated account."""
+    devices = (
+        db.query(Device)
+        .filter(Device.p_hash == p_hash)
+        .order_by(Device.last_used.desc())
+        .all()
+    )
     return {
         "status": "success",
         "devices": [
@@ -1037,111 +1001,115 @@ async def get_devices(phone: str, country_code: Optional[str] = None, db: Sessio
                 "is_primary": d.is_primary,
                 "is_verified": d.is_verified,
                 "last_used": d.last_used,
-                "created_at": d.created_at
-            } for d in devices
+                "created_at": d.created_at,
+            }
+            for d in devices
         ],
-        "count": len(devices)
+        "count": len(devices),
     }
 
+
 @app.delete("/auth/devices")
-async def remove_device(request: Request, req: RemoveDeviceRequest, db: Session = Depends(get_db)):
-    """Remove a device from account"""
-    normalized_phone = normalize_phone(req.phone, req.country_code)
-    p_hash = generate_p_hash(normalized_phone)
-    
-    device = db.query(Device).filter(Device.p_hash == p_hash, Device.device_id == req.device_id).first()
-    
+async def remove_device(
+    request: Request,
+    req: RemoveDeviceRequest,
+    db: Session = Depends(get_db),
+    p_hash_auth: str = Depends(require_auth),
+):
+    """Remove a device. Requires authentication."""
+    try:
+        normalized = normalize_phone(req.phone, req.country_code)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+    p_hash = generate_p_hash(normalized)
+    if p_hash != p_hash_auth:
+        raise HTTPException(403, "Not authorized.")
+
+    device = db.query(Device).filter(
+        Device.p_hash == p_hash,
+        Device.device_id == req.device_id,
+    ).first()
+
     if not device:
         raise HTTPException(404, "Device not found.")
     if device.is_primary:
-        raise HTTPException(400, "Cannot remove primary device.")
-    
+        raise HTTPException(400, "Cannot remove the primary device.")
+
     db.delete(device)
     db.commit()
-    
-    log_action(db, p_hash, "device_removed", f"Device: {req.device_id}", request)
-    return {"status": "success", "message": "Device removed successfully."}
+    log_action(db, p_hash, "device_removed", f"device={req.device_id}", request)
+    return {"status": "success", "message": "Device removed."}
 
-# ============================================
-# API Routes - Phone Validation
-# ============================================
+# ── Routes: Phone validation ──────────────────────────────────────────────────
 
 @app.post("/auth/validate-phone")
 async def validate_phone(req: PhoneRequest):
-    """Validate phone number and get info"""
     try:
-        phone_info = get_phone_info(req.phone, req.country_code)
-        return {"status": "valid" if phone_info.get("is_valid") else "invalid", "data": phone_info}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+        info = get_phone_info(req.phone, req.country_code)
+        return {"status": "valid" if info.get("is_valid") else "invalid", "data": info}
+    except ValueError as exc:
+        return {"status": "invalid", "message": str(exc)}
 
-@app.get("/countries")
-async def get_supported_countries():
-    """Get list of supported countries"""
-    countries = [
-        {"code": "SA", "name": "Saudi Arabia", "dial_code": "+966", "flag": "🇸🇦"},
-        {"code": "EG", "name": "Egypt", "dial_code": "+20", "flag": "🇪🇬"},
-        {"code": "AE", "name": "United Arab Emirates", "dial_code": "+971", "flag": "🇦🇪"},
-        # ... and so on ... (truncated for brevity but keeping structure)
-        {"code": "DZ", "name": "Algeria", "dial_code": "+213", "flag": "🇩🇿"},
-        {"code": "US", "name": "United States", "dial_code": "+1", "flag": "🇺🇸"},
-        {"code": "GB", "name": "United Kingdom", "dial_code": "+44", "flag": "🇬🇧"}
-    ]
-    return {"status": "success", "count": len(countries), "countries": countries}
+# ── Routes: User info (authenticated) ─────────────────────────────────────────
 
-# ============================================
-# API Routes - User Info
-# ============================================
-
-@app.get("/auth/user/{phone}")
-async def get_user_info(phone: str, country_code: Optional[str] = None, db: Session = Depends(get_db)):
-    """Get user information"""
-    normalized_phone = normalize_phone(phone, country_code)
-    p_hash = generate_p_hash(normalized_phone)
-    
+@app.get("/auth/me")
+async def get_me(
+    db: Session = Depends(get_db),
+    p_hash: str = Depends(require_auth),
+):
+    """Get authenticated user's own information."""
     user = db.query(User).filter(User.p_hash == p_hash).first()
     if not user:
-        raise HTTPException(404, "User not found")
-    
+        raise HTTPException(404, "User not found.")
     return {
         "status": "success",
         "data": {
             "phone": user.phone_number,
             "country_code": user.country_code,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
             "is_verified": user.is_verified,
             "sim_verified": user.sim_verified,
             "email_verified": user.email_verified,
             "created_at": user.created_at,
             "last_login": user.last_login,
-            "login_count": user.login_count
-        }
+            "login_count": user.login_count,
+        },
     }
 
-# ============================================
-# Error Handlers
-# ============================================
+# ── Error handlers ────────────────────────────────────────────────────────────
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(
         status_code=exc.status_code,
-        content={"status": "error", "code": exc.status_code, "message": exc.detail}
+        content={"status": "error", "code": exc.status_code, "message": exc.detail},
     )
+
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception: %s", exc)
     return JSONResponse(
         status_code=500,
         content={
-            "status": "error", "code": 500, "message": "Internal Server Error",
-            "detail": str(exc) if os.environ.get("DEBUG") else None
-        }
+            "status": "error",
+            "code": 500,
+            "message": "Internal server error.",
+            # Only expose detail in debug mode
+            "detail": str(exc) if Config.DEBUG else None,
+        },
     )
 
-# ============================================
-# Run Server
-# ============================================
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=Config.DEBUG,
+        log_level="debug" if Config.DEBUG else "info",
+    )

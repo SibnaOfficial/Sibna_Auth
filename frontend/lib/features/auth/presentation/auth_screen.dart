@@ -5,21 +5,20 @@ import 'package:animate_do/animate_do.dart';
 import 'package:pinput/pinput.dart';
 import 'package:intl_phone_field/intl_phone_field.dart';
 import 'package:sim_card_info/sim_card_info.dart';
-import 'package:sim_card_info/sim_info.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:device_info_plus/device_info_plus.dart';
 import '../../../core/constants/constants.dart';
 import '../../../core/services/api_service.dart';
 import '../../vault/presentation/vault_screen.dart';
 
-enum AuthStep { 
-  landing, 
-  terms, 
-  signInInfo, 
-  confirmInfo, 
-  recoveryPhone, 
-  recoveryEmail, 
-  otpVerify 
+enum _Step {
+  landing,
+  terms,
+  signInInfo,
+  confirmInfo,
+  recoveryPhone,
+  recoveryEmail,
+  otpVerify,
 }
 
 class AuthScreen extends StatefulWidget {
@@ -30,154 +29,167 @@ class AuthScreen extends StatefulWidget {
 }
 
 class _AuthScreenState extends State<AuthScreen> {
-  AuthStep _currentStep = AuthStep.landing;
-  final TextEditingController _phoneController = TextEditingController();
-  final TextEditingController _emailController = TextEditingController();
-  final ApiService _apiService = ApiService();
-  final SimCardInfo _simCardInfo = SimCardInfo();
-  
+  _Step _step = _Step.landing;
+
+  final _api = ApiService.instance;
+  final _sim = SimCardInfo();
+
+  final _phoneCtrl = TextEditingController();
+  final _emailCtrl = TextEditingController();
+  final _firstNameCtrl = TextEditingController();
+  final _lastNameCtrl = TextEditingController();
+
   bool _isLoading = false;
-  String _completePhoneNumber = "";
-  String _selectedCountryCode = "DZ";
-  String? _simPhoneNumber;
+  bool _termsAgreed = false;
+  String _fullPhone = '';
+  String _countryCode = 'DZ';
+  String? _simPhone;
   String? _carrierName;
 
-  // Timer for Resend OTP
-  Timer? _resendTimer;
-  int _resendCountdown = 30;
+  // OTP resend timer
+  Timer? _timer;
+  int _countdown = 30;
   bool _canResend = false;
 
   @override
   void initState() {
     super.initState();
-    _readSimCard();
-    _phoneController.addListener(() {
-      final text = _phoneController.text;
-      if (text.startsWith('0')) {
-        _phoneController.value = _phoneController.value.copyWith(
-          text: text.replaceFirst('0', ''),
-          selection: TextSelection.collapsed(offset: text.length - 1),
-        );
-      }
-    });
+    _tryReadSim();
+    _phoneCtrl.addListener(_stripLeadingZero);
   }
 
   @override
   void dispose() {
-    _resendTimer?.cancel();
-    _phoneController.dispose();
-    _emailController.dispose();
-    _firstNameController.dispose();
-    _lastNameController.dispose();
+    _timer?.cancel();
+    _phoneCtrl
+      ..removeListener(_stripLeadingZero)
+      ..dispose();
+    _emailCtrl.dispose();
+    _firstNameCtrl.dispose();
+    _lastNameCtrl.dispose();
     super.dispose();
   }
 
-  void _startResendTimer() {
-    _resendTimer?.cancel();
-    setState(() {
-      _resendCountdown = 30;
-      _canResend = false;
-    });
-    _resendTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (_resendCountdown == 0) {
-        setState(() {
-          _canResend = true;
-          timer.cancel();
-        });
-      } else {
-        setState(() {
-          _resendCountdown--;
-        });
-      }
-    });
-  }
+  // ── Helpers ────────────────────────────────────────────────────────────────
 
-  Future<void> _resendCode() async {
-    if (!_canResend) return;
-    setState(() => _isLoading = true);
-    try {
-      await _apiService.linkEmail(
-        phone: _completePhoneNumber.isNotEmpty ? _completePhoneNumber : (_simPhoneNumber ?? ""),
-        email: _emailController.text,
+  void _stripLeadingZero() {
+    final t = _phoneCtrl.text;
+    if (t.startsWith('0')) {
+      _phoneCtrl.value = _phoneCtrl.value.copyWith(
+        text: t.substring(1),
+        selection: TextSelection.collapsed(offset: t.length - 1),
       );
-      _startResendTimer();
-      // Professional Success Feedback
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Row(
-            children: const [
-              Icon(Icons.check_circle, color: Colors.white, size: 20),
-              SizedBox(width: 12),
-              Text('Verification code sent successfully', style: TextStyle(fontWeight: FontWeight.w600)),
-            ],
-          ),
-          backgroundColor: Colors.green.shade800,
-          behavior: SnackBarBehavior.floating,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-          margin: const EdgeInsets.all(20),
-        ),
-      );
-    } catch (e) {
-      if (e.toString().contains('429')) {
-        showDialog(
-          context: context,
-          builder: (context) => AlertDialog(
-            backgroundColor: Colors.white,
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-            title: Row(
-              children: const [
-                Icon(Icons.warning_amber_rounded, color: Colors.redAccent),
-                SizedBox(width: 12),
-                Text('Security Limit', style: TextStyle(fontWeight: FontWeight.bold)),
-              ],
-            ),
-            content: const Text(
-              'For your security, you have reached the maximum number of attempts. Please try again in 30 minutes.',
-              style: TextStyle(fontSize: 16, height: 1.4),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('UNDERSTOOD', style: TextStyle(color: Colors.black, fontWeight: FontWeight.w800, letterSpacing: 1)),
-              ),
-            ],
-          ),
-        );
-      } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Verification Error: $e'),
-            backgroundColor: Colors.redAccent,
-            behavior: SnackBarBehavior.floating,
-            margin: const EdgeInsets.all(20),
-          ),
-        );
-      }
-    } finally {
-      setState(() => _isLoading = false);
     }
   }
 
-  Future<void> _readSimCard() async {
-    // Permission request moved to signInInfo step
+  void _startTimer() {
+    _timer?.cancel();
+    setState(() {
+      _countdown = 30;
+      _canResend = false;
+    });
+    _timer = Timer.periodic(const Duration(seconds: 1), (t) {
+      if (_countdown == 0) {
+        setState(() => _canResend = true);
+        t.cancel();
+      } else {
+        setState(() => _countdown--);
+      }
+    });
+  }
+
+  Future<void> _tryReadSim() async {
     try {
-      final simInfoList = await _simCardInfo.getSimInfo();
-      if (simInfoList != null && simInfoList.isNotEmpty) {
-        setState(() {
-          _simPhoneNumber = simInfoList.first.number;
-          _carrierName = simInfoList.first.carrierName; // Fixed: Use carrierName
-        });
+      final list = await _sim.getSimInfo();
+      if (list != null && list.isNotEmpty) {
+        if (mounted) {
+          setState(() {
+            _simPhone = list.first.number;
+            _carrierName = list.first.carrierName;
+          });
+        }
       }
     } catch (_) {}
   }
 
-  void _navigateToVault() {
+  Future<String> _deviceId() async {
+    try {
+      final info = DeviceInfoPlugin();
+      if (Platform.isAndroid) return (await info.androidInfo).id;
+      if (Platform.isIOS) return (await info.iosInfo).identifierForVendor ?? 'unknown';
+    } catch (_) {}
+    return 'device_${DateTime.now().millisecondsSinceEpoch}';
+  }
+
+  void _goTo(_Step s) => setState(() => _step = s);
+
+  void _toVault() {
+    if (!mounted) return;
     Navigator.of(context).pushReplacement(
       MaterialPageRoute(builder: (_) => const VaultScreen()),
     );
   }
 
-  Widget _buildNextButton({required VoidCallback? onPressed, bool loading = false}) {
+  void _showError(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        backgroundColor: AppColors.error,
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.all(20),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      ),
+    );
+  }
+
+  void _showSuccess(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(children: [
+          const Icon(Icons.check_circle, color: Colors.white, size: 20),
+          const SizedBox(width: 12),
+          Text(msg, style: const TextStyle(fontWeight: FontWeight.w600)),
+        ]),
+        backgroundColor: AppColors.success,
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.all(20),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      ),
+    );
+  }
+
+  // ── Build ──────────────────────────────────────────────────────────────────
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.white,
+      body: SafeArea(
+        child: AnimatedSwitcher(
+          duration: const Duration(milliseconds: 350),
+          child: _buildStep(),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildStep() {
+    switch (_step) {
+      case _Step.landing:      return _landing();
+      case _Step.terms:        return _terms();
+      case _Step.signInInfo:   return _signInInfo();
+      case _Step.confirmInfo:  return _confirmInfo();
+      case _Step.recoveryPhone: return _recoveryPhone();
+      case _Step.recoveryEmail: return _recoveryEmail();
+      case _Step.otpVerify:    return _otpView();
+    }
+  }
+
+  // ── Common widgets ─────────────────────────────────────────────────────────
+
+  Widget _nextBtn({required VoidCallback? onPressed, bool loading = false}) {
     return ElevatedButton(
       onPressed: loading ? null : onPressed,
       style: ElevatedButton.styleFrom(
@@ -187,20 +199,24 @@ class _AuthScreenState extends State<AuthScreen> {
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
         minimumSize: const Size(100, 50),
       ),
-      child: loading 
-        ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
-        : Row(
-            mainAxisSize: MainAxisSize.min,
-            children: const [
-              Text('Next', style: TextStyle(fontWeight: FontWeight.bold)),
-              SizedBox(width: 8),
-              Icon(Icons.arrow_forward, size: 18),
-            ],
-          ),
+      child: loading
+          ? const SizedBox(
+              width: 20,
+              height: 20,
+              child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
+            )
+          : const Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text('Next', style: TextStyle(fontWeight: FontWeight.bold)),
+                SizedBox(width: 8),
+                Icon(Icons.arrow_forward, size: 18),
+              ],
+            ),
     );
   }
 
-  Widget _buildBackButton({required VoidCallback onPressed}) {
+  Widget _backBtn(VoidCallback onPressed) {
     return CircleAvatar(
       radius: 24,
       backgroundColor: const Color(0xFFF1F1F1),
@@ -211,51 +227,21 @@ class _AuthScreenState extends State<AuthScreen> {
     );
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.white,
-      body: SafeArea(
-        child: AnimatedSwitcher(
-          duration: const Duration(milliseconds: 400),
-          child: _buildCurrentStep(),
-        ),
-      ),
-    );
-  }
+  // ── Steps ──────────────────────────────────────────────────────────────────
 
-  Widget _buildCurrentStep() {
-    switch (_currentStep) {
-      case AuthStep.landing:
-        return _buildLandingView();
-      case AuthStep.terms:
-        return _buildTermsView();
-      case AuthStep.signInInfo:
-        return _buildSignInInfoView();
-      case AuthStep.confirmInfo:
-        return _buildConfirmInfoView();
-      case AuthStep.recoveryPhone:
-        return _buildRecoveryPhoneView();
-      case AuthStep.recoveryEmail:
-        return _buildRecoveryEmailView();
-      case AuthStep.otpVerify:
-        return _buildOtpView();
-    }
-  }
-
-  Widget _buildLandingView() {
+  Widget _landing() {
     return Padding(
+      key: const ValueKey('landing'),
       padding: const EdgeInsets.symmetric(horizontal: 24),
       child: Center(
-        key: const ValueKey('landing'),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            FadeInDown(child: const Icon(Icons.security, size: 80, color: Colors.black)),
+            FadeInDown(child: const Icon(Icons.security_rounded, size: 80, color: Colors.black)),
             const SizedBox(height: 48),
             FadeInUp(
               child: Text(
-                'SIBNA Vault',
+                '${AppConstants.appName} Vault',
                 style: Theme.of(context).textTheme.displayLarge?.copyWith(fontSize: 32),
               ),
             ),
@@ -263,7 +249,7 @@ class _AuthScreenState extends State<AuthScreen> {
             FadeInUp(
               delay: const Duration(milliseconds: 100),
               child: Text(
-                'Highly secure local encryption for your data.',
+                'Secure end-to-end encrypted storage for your data.',
                 textAlign: TextAlign.center,
                 style: Theme.of(context).textTheme.bodyMedium,
               ),
@@ -271,22 +257,17 @@ class _AuthScreenState extends State<AuthScreen> {
             const SizedBox(height: 80),
             FadeInUp(
               delay: const Duration(milliseconds: 200),
-              child: Container(
+              child: SizedBox(
                 width: double.infinity,
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(16),
-                  boxShadow: [
-                    BoxShadow(color: Colors.black.withOpacity(0.1), blurRadius: 10, offset: const Offset(0, 4)),
-                  ],
-                ),
                 child: ElevatedButton(
-                  onPressed: () => setState(() => _currentStep = AuthStep.terms),
+                  onPressed: () => _goTo(_Step.terms),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.black,
                     minimumSize: const Size(double.infinity, 60),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
                   ),
-                  child: const Text('Start', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                  child: const Text('Get Started',
+                      style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
                 ),
               ),
             ),
@@ -294,10 +275,14 @@ class _AuthScreenState extends State<AuthScreen> {
             FadeInUp(
               delay: const Duration(milliseconds: 300),
               child: TextButton(
-                onPressed: () => setState(() => _currentStep = AuthStep.recoveryPhone),
+                onPressed: () => _goTo(_Step.recoveryPhone),
                 child: const Text(
                   'Recover Account',
-                  style: TextStyle(color: Colors.black87, fontWeight: FontWeight.w600, fontSize: 15, decoration: TextDecoration.underline),
+                  style: TextStyle(
+                      color: Colors.black87,
+                      fontWeight: FontWeight.w600,
+                      fontSize: 15,
+                      decoration: TextDecoration.underline),
                 ),
               ),
             ),
@@ -307,56 +292,63 @@ class _AuthScreenState extends State<AuthScreen> {
     );
   }
 
-  bool _termsAgreed = false;
-  final TextEditingController _firstNameController = TextEditingController();
-  final TextEditingController _lastNameController = TextEditingController();
-
-  Widget _buildTermsView() {
+  Widget _terms() {
     return Column(
+      key: const ValueKey('terms'),
       children: [
         Expanded(
           child: SingleChildScrollView(
-            child: Padding(
-              padding: const EdgeInsets.all(24.0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  IconButton(onPressed: () => setState(() => _currentStep = AuthStep.landing), icon: const Icon(Icons.arrow_back)),
-                  const SizedBox(height: 40),
-                  FadeInLeft(
-                    child: Text(
-                      "Review Rider's Terms and Privacy Notice",
-                      style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                        color: Colors.black, 
-                        fontWeight: FontWeight.w600,
-                        fontSize: 26,
-                      ),
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                IconButton(
+                    onPressed: () => _goTo(_Step.landing),
+                    icon: const Icon(Icons.arrow_back)),
+                const SizedBox(height: 40),
+                FadeInLeft(
+                  child: Text(
+                    'Terms and Privacy',
+                    style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                          color: Colors.black,
+                          fontWeight: FontWeight.w600,
+                          fontSize: 26,
+                        ),
+                  ),
+                ),
+                const SizedBox(height: 24),
+                FadeInLeft(
+                  delay: const Duration(milliseconds: 100),
+                  child: RichText(
+                    text: TextSpan(
+                      style: Theme.of(context)
+                          .textTheme
+                          .bodyMedium
+                          ?.copyWith(color: Colors.black54, height: 1.6, fontSize: 13),
+                      children: [
+                        const TextSpan(
+                            text:
+                                'By selecting "I agree", I confirm that I have read and accept the '),
+                        TextSpan(
+                            text: 'Terms of Use',
+                            style: TextStyle(
+                                color: Colors.blue[800], fontWeight: FontWeight.bold)),
+                        const TextSpan(text: ' and the '),
+                        TextSpan(
+                            text: 'Privacy Policy',
+                            style: TextStyle(
+                                color: Colors.blue[800], fontWeight: FontWeight.bold)),
+                        const TextSpan(text: '.'),
+                      ],
                     ),
                   ),
-                  const SizedBox(height: 24),
-                  FadeInLeft(
-                    delay: const Duration(milliseconds: 100),
-                    child: RichText(
-                      text: TextSpan(
-                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: Colors.black54, height: 1.6, fontSize: 13),
-                        children: [
-                          const TextSpan(text: 'By selecting "I agree", I confirm that I have read and accept the '),
-                          TextSpan(text: 'Terms of Use', style: TextStyle(color: Colors.blue[800], fontWeight: FontWeight.bold)),
-                          const TextSpan(text: ' and acknowledge the '),
-                          TextSpan(text: 'Privacy Notice', style: TextStyle(color: Colors.blue[800], fontWeight: FontWeight.bold)),
-                          const TextSpan(text: '.'),
-                        ],
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 40),
-                ],
-              ),
+                ),
+              ],
             ),
           ),
         ),
         Padding(
-          padding: const EdgeInsets.all(24.0),
+          padding: const EdgeInsets.all(24),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -365,7 +357,11 @@ class _AuthScreenState extends State<AuthScreen> {
                 borderRadius: BorderRadius.circular(8),
                 child: Row(
                   children: [
-                    Text('I agree', style: Theme.of(context).textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w600)),
+                    Text('I agree',
+                        style: Theme.of(context)
+                            .textTheme
+                            .bodyLarge
+                            ?.copyWith(fontWeight: FontWeight.w600)),
                     const Spacer(),
                     SizedBox(
                       height: 26,
@@ -385,10 +381,10 @@ class _AuthScreenState extends State<AuthScreen> {
               const SizedBox(height: 24),
               Row(
                 children: [
-                  _buildBackButton(onPressed: () => setState(() => _currentStep = AuthStep.landing)),
+                  _backBtn(() => _goTo(_Step.landing)),
                   const Spacer(),
-                  _buildNextButton(
-                    onPressed: _termsAgreed ? () => setState(() => _currentStep = AuthStep.signInInfo) : null,
+                  _nextBtn(
+                    onPressed: _termsAgreed ? () => _goTo(_Step.signInInfo) : null,
                   ),
                 ],
               ),
@@ -399,48 +395,52 @@ class _AuthScreenState extends State<AuthScreen> {
     );
   }
 
-  Widget _buildSignInInfoView() {
+  Widget _signInInfo() {
     return Column(
+      key: const ValueKey('signInInfo'),
       children: [
         Expanded(
           child: SingleChildScrollView(
-            child: Padding(
-              padding: const EdgeInsets.all(24.0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  IconButton(onPressed: () => setState(() => _currentStep = AuthStep.terms), icon: const Icon(Icons.arrow_back)),
-                  const SizedBox(height: 40),
-                  FadeInLeft(
-                    child: Text(
-                      'Use your phone number to sign in to Rider',
-                      style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                        color: Colors.black, 
-                        fontWeight: FontWeight.w600,
-                        fontSize: 26,
-                      ),
-                    ),
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                IconButton(
+                    onPressed: () => _goTo(_Step.terms),
+                    icon: const Icon(Icons.arrow_back)),
+                const SizedBox(height: 40),
+                FadeInLeft(
+                  child: Text(
+                    'Verify your phone number',
+                    style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                          color: Colors.black,
+                          fontWeight: FontWeight.w600,
+                          fontSize: 26,
+                        ),
                   ),
-                  const SizedBox(height: 24),
-                  FadeInLeft(
-                    delay: const Duration(milliseconds: 100),
-                    child: Text(
-                      "We'll use a Google service to verify your number with your carrier. It's simple and secure—and only takes a few seconds.",
-                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: Colors.black54, height: 1.5, fontSize: 13),
-                    ),
+                ),
+                const SizedBox(height: 24),
+                FadeInLeft(
+                  delay: const Duration(milliseconds: 100),
+                  child: Text(
+                    'SIBNA will detect your SIM card to verify your number quickly and securely.',
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodyMedium
+                        ?.copyWith(color: Colors.black54, height: 1.5, fontSize: 13),
                   ),
-                ],
-              ),
+                ),
+              ],
             ),
           ),
         ),
         Padding(
-          padding: const EdgeInsets.all(24.0),
+          padding: const EdgeInsets.all(24),
           child: Row(
             children: [
-              _buildBackButton(onPressed: () => setState(() => _currentStep = AuthStep.terms)),
+              _backBtn(() => _goTo(_Step.terms)),
               const Spacer(),
-              _buildNextButton(onPressed: _handleSignInInfoNext),
+              _nextBtn(onPressed: _onSignInNext, loading: _isLoading),
             ],
           ),
         ),
@@ -448,338 +448,360 @@ class _AuthScreenState extends State<AuthScreen> {
     );
   }
 
-  Widget _buildConfirmInfoView() {
-    return Column(
-      children: [
-        Expanded(
-          child: SingleChildScrollView(
-            child: Padding(
-              padding: const EdgeInsets.all(24.0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  IconButton(onPressed: () => setState(() => _currentStep = AuthStep.signInInfo), icon: const Icon(Icons.arrow_back)),
-                  const SizedBox(height: 40),
-                  FadeInLeft(
-                    child: Text(
-                      'Confirm your information',
-                      style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                        color: Colors.black, 
-                        fontWeight: FontWeight.w700,
-                        fontSize: 26,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 40),
-                  Text('Phone number', style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.grey[600], fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 8),
-                  Row(
-                    children: [
-                      Text(_simPhoneNumber ?? _completePhoneNumber, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                      const SizedBox(width: 8),
-                      const Icon(Icons.check_circle, color: Color(0xFF1A73E8), size: 18),
-                    ],
-                  ),
-                  const SizedBox(height: 48),
-                  Text('First name', style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.grey[600], fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 8),
-                  TextField(
-                    controller: _firstNameController,
-                    decoration: InputDecoration(
-                      filled: true,
-                      fillColor: const Color(0xFFF6F6F6),
-                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
-                      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
-                    ),
-                  ),
-                  const SizedBox(height: 32),
-                  Text('Last name', style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.grey[600], fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 8),
-                  TextField(
-                    controller: _lastNameController,
-                    decoration: InputDecoration(
-                      filled: true,
-                      fillColor: const Color(0xFFF6F6F6),
-                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
-                      focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: const BorderSide(color: Colors.black, width: 1.5)),
-                      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
-                    ),
-                  ),
-                  const SizedBox(height: 24),
-                ],
-              ),
-            ),
-          ),
-        ),
-        Padding(
-          padding: const EdgeInsets.all(24.0),
-          child: Row(
-            children: [
-              _buildBackButton(onPressed: () => setState(() => _currentStep = AuthStep.signInInfo)),
-              const Spacer(),
-              _buildNextButton(onPressed: _handleProfileSubmit, loading: _isLoading),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-
-  Future<void> _handleSignInInfoNext() async {
-    final status = await Permission.phone.request();
-    if (status.isGranted) {
-      await _readSimCard();
-      if (_simPhoneNumber != null) {
-        _showShareInfoBottomSheet();
+  Future<void> _onSignInNext() async {
+    setState(() => _isLoading = true);
+    try {
+      final status = await Permission.phone.request();
+      if (status.isGranted) {
+        await _tryReadSim();
+        if (_simPhone != null) {
+          _showSimSheet();
+        } else {
+          _goTo(_Step.recoveryPhone);
+        }
       } else {
-        setState(() => _currentStep = AuthStep.recoveryPhone);
+        _goTo(_Step.recoveryPhone);
       }
-    } else {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Phone permission required for SIM verification.')));
+    } finally {
+      setState(() => _isLoading = false);
     }
   }
 
-  void _showShareInfoBottomSheet() {
+  void _showSimSheet() {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.white,
       shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.only(topLeft: Radius.circular(28), topRight: Radius.circular(28))
+        borderRadius: BorderRadius.only(
+          topLeft: Radius.circular(28),
+          topRight: Radius.circular(28),
+        ),
       ),
-      builder: (context) {
-        return ConstrainedBox(
-          constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.9),
-          child: SingleChildScrollView(
-            child: Padding(
-              padding: EdgeInsets.fromLTRB(28, 36, 28, MediaQuery.of(context).viewInsets.bottom + 32),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Share information with Rider?', 
-                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w700, fontSize: 19)
-                  ),
-                  const SizedBox(height: 24),
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFF9F4E8), // Authentic beige
-                      borderRadius: BorderRadius.circular(20),
-                      border: Border.all(color: const Color(0xFFE8E0CC), width: 1),
-                    ),
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Icon(Icons.phone_android, size: 28, color: Colors.black),
-                        const SizedBox(width: 20),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(_carrierName ?? 'Vi', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.black)),
-                              const SizedBox(height: 4),
-                              Text(_simPhoneNumber ?? '', style: const TextStyle(fontSize: 16, color: Colors.black87, letterSpacing: 0.5)),
-                              const SizedBox(height: 20),
-                              const Text(
-                                'This information will be shared:', 
-                                style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.black)
-                              ),
-                              const SizedBox(height: 4),
-                              const Text('• Phone number', style: TextStyle(fontSize: 13, color: Colors.black87)),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 24),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 4),
-                    child: Text(
-                      'When you click "Agree and Continue", Google will enable your carrier (${_carrierName ?? 'Vi'}) to share your number with Rider.',
-                      style: const TextStyle(fontSize: 12, color: Colors.black54, height: 1.5),
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 4),
-                    child: RichText(
-                      text: TextSpan(
-                        style: const TextStyle(fontSize: 11, color: Colors.black45, height: 1.5),
+      builder: (ctx) => ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: MediaQuery.of(ctx).size.height * 0.9),
+        child: SingleChildScrollView(
+          padding: EdgeInsets.fromLTRB(
+              28, 36, 28, MediaQuery.of(ctx).viewInsets.bottom + 32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Share phone number with ${AppConstants.appName}?',
+                style: Theme.of(ctx)
+                    .textTheme
+                    .headlineSmall
+                    ?.copyWith(fontWeight: FontWeight.w700, fontSize: 19),
+              ),
+              const SizedBox(height: 24),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF9F4E8),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: const Color(0xFFE8E0CC)),
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Icon(Icons.sim_card, size: 28, color: Colors.black),
+                    const SizedBox(width: 20),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          const TextSpan(text: 'Provider terms: Allow your carrier to share your phone number with Google. Google will then share it with this app, see '),
-                          TextSpan(
-                            text: "Google's Privacy Policy", 
-                            style: TextStyle(color: Colors.blue[800], decoration: TextDecoration.underline, fontWeight: FontWeight.w500)
+                          Text(
+                            _carrierName ?? 'Carrier',
+                            style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 16,
+                                color: Colors.black),
                           ),
-                          const TextSpan(text: ". App's use is then subject to the "),
-                          TextSpan(
-                            text: "app's Privacy Policy", 
-                            style: TextStyle(color: Colors.blue[800], decoration: TextDecoration.underline, fontWeight: FontWeight.w500)
+                          const SizedBox(height: 4),
+                          Text(
+                            _simPhone ?? '',
+                            style: const TextStyle(
+                                fontSize: 16,
+                                color: Colors.black87,
+                                letterSpacing: 0.5),
                           ),
-                          const TextSpan(text: "."),
                         ],
                       ),
                     ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 32),
+              Row(
+                children: [
+                  TextButton(
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      _goTo(_Step.recoveryPhone);
+                    },
+                    child: const Text('Cancel',
+                        style: TextStyle(color: Colors.black, fontSize: 16)),
                   ),
-                  const SizedBox(height: 36),
-                  Row(
-                    children: [
-                      TextButton(
-                        onPressed: () => Navigator.pop(context), 
-                        child: const Text('Cancel', style: TextStyle(color: Colors.black, fontSize: 16, fontWeight: FontWeight.w500))
-                      ),
-                      const Spacer(),
-                      ElevatedButton(
-                        onPressed: () {
-                          Navigator.pop(context);
-                          _handleSimVerify();
-                        },
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF7A5901),
-                          minimumSize: const Size(180, 54),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
-                          elevation: 0,
-                        ),
-                        child: const Text('Agree and Continue', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 15)),
-                      ),
-                    ],
+                  const Spacer(),
+                  ElevatedButton(
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      _handleSimVerify();
+                    },
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.black,
+                      minimumSize: const Size(160, 54),
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(30)),
+                    ),
+                    child: const Text('Confirm',
+                        style: TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 15)),
                   ),
                 ],
               ),
-            ),
+            ],
           ),
-        );
-      },
+        ),
+      ),
     );
   }
+
   Future<void> _handleSimVerify() async {
+    if (_simPhone == null) return;
     setState(() => _isLoading = true);
     try {
-      String deviceId = "device_001";
-      try {
-        final deviceInfo = DeviceInfoPlugin();
-        if (Platform.isAndroid) {
-          final androidInfo = await deviceInfo.androidInfo;
-          deviceId = androidInfo.id;
-        } else if (Platform.isIOS) {
-          final iosInfo = await deviceInfo.iosInfo;
-          deviceId = iosInfo.identifierForVendor ?? "device_001";
-        }
-      } catch (_) {}
-
-      final res = await _apiService.verifySim(
-        simPhone: _simPhoneNumber, 
-        enteredPhone: _simPhoneNumber!, 
-        deviceId: deviceId 
+      final devId = await _deviceId();
+      final res = await _api.verifySim(
+        simPhone: _simPhone,
+        enteredPhone: _simPhone!,
+        deviceId: devId,
       );
-
-      if (res['next_step'] == 'profile' || res['status'] == 'match') {
-        setState(() => _currentStep = AuthStep.confirmInfo);
+      if (res['status'] == 'match') {
+        _fullPhone = res['phone'] as String? ?? _simPhone!;
+        _goTo(_Step.confirmInfo);
       } else {
-        setState(() => _currentStep = AuthStep.recoveryPhone);
+        _goTo(_Step.recoveryPhone);
       }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Verification Error: $e')));
+      _showError('Verification error. Please try manually.');
+      _goTo(_Step.recoveryPhone);
     } finally {
       setState(() => _isLoading = false);
     }
   }
 
-  Future<void> _handleProfileSubmit() async {
-    if (_firstNameController.text.isEmpty || _lastNameController.text.isEmpty) return;
-    setState(() => _isLoading = true);
-    try {
-      await _apiService.updateProfile(
-        phone: _simPhoneNumber ?? _completePhoneNumber,
-        firstName: _firstNameController.text,
-        lastName: _lastNameController.text,
-      );
-      _navigateToVault();
-    } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error updating profile: $e')));
-    } finally {
-      setState(() => _isLoading = false);
-    }
-  }
-
-  Widget _buildRecoveryPhoneView() {
+  Widget _confirmInfo() {
     return Column(
+      key: const ValueKey('confirmInfo'),
       children: [
         Expanded(
           child: SingleChildScrollView(
-            child: Padding(
-              key: const ValueKey('rec_phone'),
-              padding: const EdgeInsets.all(24.0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  IconButton(onPressed: () => setState(() => _currentStep = AuthStep.landing), icon: const Icon(Icons.arrow_back)),
-                  const SizedBox(height: 20),
-                  FadeInLeft(child: Text('Recovery', style: Theme.of(context).textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w700, fontSize: 28))),
-                  const SizedBox(height: 12),
-                  FadeInLeft(child: Text('Enter your registered phone number.', style: Theme.of(context).textTheme.bodyMedium?.copyWith(fontSize: 16))),
-                  const SizedBox(height: 48),
-                  
-                  if (_simPhoneNumber != null) ...[
-                    ListTile(
-                      contentPadding: EdgeInsets.zero,
-                      leading: const CircleAvatar(backgroundColor: Color(0xFFF6F6F6), child: Icon(Icons.sim_card, color: Colors.black)),
-                      title: Text(_simPhoneNumber!, style: const TextStyle(fontWeight: FontWeight.bold)),
-                      subtitle: const Text('Detected SIM card'),
-                      trailing: const Text('Use this', style: TextStyle(color: AppColors.accent, fontWeight: FontWeight.bold)),
-                      onTap: () {
-                        setState(() {
-                          String normalized = _simPhoneNumber!.replaceFirst('+', '');
-                          if (normalized.startsWith('213')) normalized = normalized.replaceFirst('213', '');
-                          if (normalized.startsWith('0')) normalized = normalized.replaceFirst('0', '');
-                          _phoneController.text = normalized;
-                          _completePhoneNumber = "+213$normalized";
-                          _currentStep = AuthStep.recoveryEmail;
-                        });
-                      },
-                    ),
-                    const Divider(),
-                    const SizedBox(height: 12),
-                  ],
-                  
-                  IntlPhoneField(
-                    controller: _phoneController,
-                    initialCountryCode: 'DZ',
-                    invalidNumberMessage: 'Enter a valid number format',
-                    decoration: const InputDecoration(
-                      labelText: 'Phone Number', 
-                      counterText: '',
-                      labelStyle: TextStyle(color: Colors.black54),
-                      floatingLabelStyle: TextStyle(color: Colors.black),
-                      errorStyle: TextStyle(color: Color(0xFF555555), fontSize: 13), // Professional subtle grey error
-                      focusedErrorBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.black, width: 2)),
-                      errorBorder: UnderlineInputBorder(borderSide: BorderSide(color: Color(0xFFCCCCCC))),
-                    ),
-                    onChanged: (phone) {
-                      _completePhoneNumber = phone.completeNumber;
-                      _selectedCountryCode = phone.countryISOCode;
-                    },
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                IconButton(
+                    onPressed: () => _goTo(_Step.signInInfo),
+                    icon: const Icon(Icons.arrow_back)),
+                const SizedBox(height: 40),
+                FadeInLeft(
+                  child: Text(
+                    'Confirm your information',
+                    style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                          color: Colors.black,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 26,
+                        ),
                   ),
-                ],
-              ),
+                ),
+                const SizedBox(height: 40),
+                Text('Phone number',
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodySmall
+                        ?.copyWith(color: Colors.grey[600], fontWeight: FontWeight.bold)),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Text(_fullPhone.isNotEmpty ? _fullPhone : (_simPhone ?? ''),
+                        style: const TextStyle(
+                            fontSize: 18, fontWeight: FontWeight.bold)),
+                    const SizedBox(width: 8),
+                    const Icon(Icons.check_circle,
+                        color: Color(0xFF1A73E8), size: 18),
+                  ],
+                ),
+                const SizedBox(height: 48),
+                Text('First name',
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodySmall
+                        ?.copyWith(color: Colors.grey[600], fontWeight: FontWeight.bold)),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: _firstNameCtrl,
+                  textCapitalization: TextCapitalization.words,
+                  decoration: InputDecoration(
+                    filled: true,
+                    fillColor: const Color(0xFFF6F6F6),
+                    border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide.none),
+                    contentPadding:
+                        const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+                  ),
+                ),
+                const SizedBox(height: 32),
+                Text('Last name',
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodySmall
+                        ?.copyWith(color: Colors.grey[600], fontWeight: FontWeight.bold)),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: _lastNameCtrl,
+                  textCapitalization: TextCapitalization.words,
+                  decoration: InputDecoration(
+                    filled: true,
+                    fillColor: const Color(0xFFF6F6F6),
+                    border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide.none),
+                    focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide:
+                            const BorderSide(color: Colors.black, width: 1.5)),
+                    contentPadding:
+                        const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+                  ),
+                ),
+              ],
             ),
           ),
         ),
         Padding(
-          padding: const EdgeInsets.all(24.0),
+          padding: const EdgeInsets.all(24),
+          child: Row(
+            children: [
+              _backBtn(() => _goTo(_Step.signInInfo)),
+              const Spacer(),
+              _nextBtn(onPressed: _handleProfileSubmit, loading: _isLoading),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _handleProfileSubmit() async {
+    final fn = _firstNameCtrl.text.trim();
+    final ln = _lastNameCtrl.text.trim();
+    if (fn.isEmpty || ln.isEmpty) {
+      _showError('Please enter your first and last name.');
+      return;
+    }
+    setState(() => _isLoading = true);
+    try {
+      final phone = _fullPhone.isNotEmpty ? _fullPhone : (_simPhone ?? '');
+      final res = await _api.updateProfile(
+          phone: phone, firstName: fn, lastName: ln);
+      if (res['status'] == 'success') {
+        _toVault();
+      } else {
+        _showError(res['message'] as String? ?? 'Error saving profile.');
+      }
+    } catch (e) {
+      _showError('Network error. Please try again.');
+    } finally {
+      setState(() => _isLoading = false);
+    }
+  }
+
+  Widget _recoveryPhone() {
+    return Column(
+      key: const ValueKey('recoveryPhone'),
+      children: [
+        Expanded(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                IconButton(
+                    onPressed: () => _goTo(_Step.landing),
+                    icon: const Icon(Icons.arrow_back)),
+                const SizedBox(height: 20),
+                FadeInLeft(
+                  child: Text('Recovery',
+                      style: Theme.of(context)
+                          .textTheme
+                          .headlineMedium
+                          ?.copyWith(fontWeight: FontWeight.w700, fontSize: 28)),
+                ),
+                const SizedBox(height: 12),
+                FadeInLeft(
+                  child: Text('Enter your registered phone number.',
+                      style: Theme.of(context)
+                          .textTheme
+                          .bodyMedium
+                          ?.copyWith(fontSize: 16)),
+                ),
+                const SizedBox(height: 48),
+                if (_simPhone != null) ...[
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const CircleAvatar(
+                        backgroundColor: Color(0xFFF6F6F6),
+                        child: Icon(Icons.sim_card, color: Colors.black)),
+                    title: Text(_simPhone!,
+                        style: const TextStyle(fontWeight: FontWeight.bold)),
+                    subtitle: Text(_carrierName ?? 'Detected SIM'),
+                    trailing: const Text('Use this',
+                        style: TextStyle(
+                            color: AppColors.accent,
+                            fontWeight: FontWeight.bold)),
+                    onTap: () => setState(() {
+                      _fullPhone = _simPhone!;
+                      _step = _Step.recoveryEmail;
+                    }),
+                  ),
+                  const Divider(),
+                  const SizedBox(height: 12),
+                ],
+                IntlPhoneField(
+                  controller: _phoneCtrl,
+                  initialCountryCode: 'DZ',
+                  invalidNumberMessage: 'Enter a valid phone number',
+                  decoration: const InputDecoration(
+                    labelText: 'Phone Number',
+                    counterText: '',
+                  ),
+                  onChanged: (phone) {
+                    _fullPhone = phone.completeNumber;
+                    _countryCode = phone.countryISOCode;
+                  },
+                ),
+              ],
+            ),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.all(24),
           child: SizedBox(
             width: double.infinity,
             child: ElevatedButton(
-              onPressed: () {
-                if (_completePhoneNumber.isNotEmpty) setState(() => _currentStep = AuthStep.recoveryEmail);
-              },
+              onPressed: _fullPhone.isNotEmpty
+                  ? () => _goTo(_Step.recoveryEmail)
+                  : null,
               style: ElevatedButton.styleFrom(
                 backgroundColor: Colors.black,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12)),
               ),
               child: const Text('Next'),
             ),
@@ -789,110 +811,69 @@ class _AuthScreenState extends State<AuthScreen> {
     );
   }
 
-  Widget _buildRecoveryEmailView() {
+  Widget _recoveryEmail() {
     return Column(
+      key: const ValueKey('recoveryEmail'),
       children: [
         Expanded(
           child: SingleChildScrollView(
-            child: Padding(
-              key: const ValueKey('rec_email'),
-              padding: const EdgeInsets.all(24.0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  IconButton(onPressed: () => setState(() => _currentStep = AuthStep.recoveryPhone), icon: const Icon(Icons.arrow_back)),
-                  const SizedBox(height: 20),
-                  FadeInLeft(child: Text('Verify Email', style: Theme.of(context).textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w700, fontSize: 26))),
-                  const SizedBox(height: 12),
-                  FadeInLeft(child: Text('Send a code to your registered email for $_completePhoneNumber', style: Theme.of(context).textTheme.bodyMedium?.copyWith(fontSize: 15, color: Colors.black54))),
-                  const SizedBox(height: 48),
-                  TextField(
-                    controller: _emailController,
-                    keyboardType: TextInputType.emailAddress,
-                    decoration: const InputDecoration(labelText: 'Email Address', hintText: 'your@email.com'),
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                IconButton(
+                    onPressed: () => _goTo(_Step.recoveryPhone),
+                    icon: const Icon(Icons.arrow_back)),
+                const SizedBox(height: 20),
+                FadeInLeft(
+                  child: Text('Verify Email',
+                      style: Theme.of(context)
+                          .textTheme
+                          .headlineMedium
+                          ?.copyWith(fontWeight: FontWeight.w700, fontSize: 26)),
+                ),
+                const SizedBox(height: 12),
+                FadeInLeft(
+                  child: Text(
+                    'We will send a 6-digit code to your registered email.',
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodyMedium
+                        ?.copyWith(fontSize: 15, color: Colors.black54),
                   ),
-                ],
-              ),
+                ),
+                const SizedBox(height: 48),
+                TextField(
+                  controller: _emailCtrl,
+                  keyboardType: TextInputType.emailAddress,
+                  autocorrect: false,
+                  decoration: const InputDecoration(
+                    labelText: 'Email Address',
+                    hintText: 'your@email.com',
+                  ),
+                ),
+              ],
             ),
           ),
         ),
         Padding(
-          padding: const EdgeInsets.all(24.0),
+          padding: const EdgeInsets.all(24),
           child: SizedBox(
             width: double.infinity,
             child: ElevatedButton(
               onPressed: _isLoading ? null : _handleRecoverySubmit,
               style: ElevatedButton.styleFrom(
                 backgroundColor: Colors.black,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12)),
               ),
-              child: _isLoading 
-                ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white)) 
-                : const Text('Get Code'),
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildOtpView() {
-    return Column(
-      children: [
-        Expanded(
-          child: SingleChildScrollView(
-            child: Padding(
-              key: const ValueKey('otp'),
-              padding: const EdgeInsets.all(24.0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  IconButton(onPressed: () => setState(() => _currentStep = AuthStep.recoveryEmail), icon: const Icon(Icons.arrow_back)),
-                  const SizedBox(height: 20),
-                  FadeInLeft(child: Text('Code Sent', style: Theme.of(context).textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w700, fontSize: 26))),
-                  const SizedBox(height: 12),
-                  FadeInLeft(child: Text('Check your inbox at ${_emailController.text}', style: Theme.of(context).textTheme.bodyMedium?.copyWith(fontSize: 15, color: Colors.black54))),
-                  const SizedBox(height: 48),
-                  FadeInUp(
-                    child: Pinput(
-                      length: 6,
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      defaultPinTheme: PinTheme(
-                        width: 56, height: 64,
-                        textStyle: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
-                        decoration: BoxDecoration(color: const Color(0xFFF6F6F6), borderRadius: BorderRadius.circular(8)),
-                      ),
-                      onCompleted: _handleOtpVerify,
-                    ),
-                  ),
-                  const SizedBox(height: 40),
-                  Center(
-                    child: Column(
-                      children: [
-                        if (!_canResend)
-                          Text(
-                            'Resend code in ${_resendCountdown}s',
-                            style: const TextStyle(color: Colors.grey, fontWeight: FontWeight.w500),
-                          )
-                        else
-                          TextButton(
-                            onPressed: _isLoading ? null : _resendCode,
-                            child: const Text(
-                              'Resend Code',
-                              style: TextStyle(
-                                color: Colors.black,
-                                fontWeight: FontWeight.bold,
-                                decoration: TextDecoration.underline,
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 32),
-                  if (_isLoading) const Center(child: CircularProgressIndicator(color: Colors.black)),
-                ],
-              ),
+              child: _isLoading
+                  ? const SizedBox(
+                      height: 20,
+                      width: 20,
+                      child: CircularProgressIndicator(
+                          strokeWidth: 2, color: Colors.white))
+                  : const Text('Send Code'),
             ),
           ),
         ),
@@ -901,17 +882,125 @@ class _AuthScreenState extends State<AuthScreen> {
   }
 
   Future<void> _handleRecoverySubmit() async {
-    if (!_emailController.text.contains('@')) return;
+    final email = _emailCtrl.text.trim();
+    if (!email.contains('@') || !email.contains('.')) {
+      _showError('Please enter a valid email address.');
+      return;
+    }
     setState(() => _isLoading = true);
     try {
-      await _apiService.linkEmail(
-        phone: _completePhoneNumber, 
-        email: _emailController.text
-      );
-      setState(() => _currentStep = AuthStep.otpVerify);
-      _startResendTimer();
+      await _api.linkEmail(phone: _fullPhone, email: email);
+      _goTo(_Step.otpVerify);
+      _startTimer();
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
+      _showError('Could not send code. Please try again.');
+    } finally {
+      setState(() => _isLoading = false);
+    }
+  }
+
+  Widget _otpView() {
+    return Column(
+      key: const ValueKey('otp'),
+      children: [
+        Expanded(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                IconButton(
+                    onPressed: () => _goTo(_Step.recoveryEmail),
+                    icon: const Icon(Icons.arrow_back)),
+                const SizedBox(height: 20),
+                FadeInLeft(
+                  child: Text('Enter Code',
+                      style: Theme.of(context)
+                          .textTheme
+                          .headlineMedium
+                          ?.copyWith(fontWeight: FontWeight.w700, fontSize: 26)),
+                ),
+                const SizedBox(height: 12),
+                FadeInLeft(
+                  child: Text(
+                    'Check your inbox at ${_emailCtrl.text}',
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodyMedium
+                        ?.copyWith(fontSize: 15, color: Colors.black54),
+                  ),
+                ),
+                const SizedBox(height: 48),
+                FadeInUp(
+                  child: Pinput(
+                    length: 6,
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    defaultPinTheme: PinTheme(
+                      width: 56,
+                      height: 64,
+                      textStyle: const TextStyle(
+                          fontSize: 24, fontWeight: FontWeight.bold),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFF6F6F6),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
+                    focusedPinTheme: PinTheme(
+                      width: 56,
+                      height: 64,
+                      textStyle: const TextStyle(
+                          fontSize: 24, fontWeight: FontWeight.bold),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFF6F6F6),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.black, width: 1.5),
+                      ),
+                    ),
+                    onCompleted: _handleOtpVerify,
+                  ),
+                ),
+                const SizedBox(height: 40),
+                Center(
+                  child: _canResend
+                      ? TextButton(
+                          onPressed: _isLoading ? null : _resendCode,
+                          child: const Text(
+                            'Resend Code',
+                            style: TextStyle(
+                                color: Colors.black,
+                                fontWeight: FontWeight.bold,
+                                decoration: TextDecoration.underline),
+                          ),
+                        )
+                      : Text(
+                          'Resend code in ${_countdown}s',
+                          style: const TextStyle(
+                              color: Colors.grey, fontWeight: FontWeight.w500),
+                        ),
+                ),
+                if (_isLoading)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 24),
+                    child: Center(
+                        child: CircularProgressIndicator(color: Colors.black)),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _resendCode() async {
+    if (!_canResend) return;
+    setState(() => _isLoading = true);
+    try {
+      await _api.linkEmail(phone: _fullPhone, email: _emailCtrl.text.trim());
+      _startTimer();
+      _showSuccess('Verification code sent.');
+    } catch (e) {
+      _showError('Could not send code. Please try again.');
     } finally {
       setState(() => _isLoading = false);
     }
@@ -920,14 +1009,14 @@ class _AuthScreenState extends State<AuthScreen> {
   Future<void> _handleOtpVerify(String pin) async {
     setState(() => _isLoading = true);
     try {
-      final res = await _apiService.verifyOtp(phone: _completePhoneNumber, otp: pin);
+      final res = await _api.verifyOtp(phone: _fullPhone, otp: pin);
       if (res['status'] == 'success' || res['status'] == 'recovery_success') {
-        _navigateToVault();
+        _toVault();
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Invalid code')));
+        _showError(res['message'] as String? ?? 'Invalid code. Please try again.');
       }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
+      _showError('Network error. Please try again.');
     } finally {
       setState(() => _isLoading = false);
     }

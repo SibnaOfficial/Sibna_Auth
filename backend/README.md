@@ -1,174 +1,68 @@
-# SIBNA Authentication System v2.5
+# SIBNA Authentication System — v3.0.0
 
-## 🎯 Features
+Backend authentication service for SIBNA. Built with FastAPI and Python 3.11.
 
-### ✅ SIM Auto-Detection
-```
-1. The app automatically reads the SIM card number
-2. Sends it to the backend for verification
-3. If matched → Fast registration without OTP
-4. If not matched → Email OTP (6 digits)
-```
+## Features
 
-### ✅ Email OTP (6 digits only)
-```
-┌──────────────────────────────────────────────┐
-│           Email OTP - 6 Digits               │
-├──────────────────────────────────────────────┤
-│                                               │
-│  Verification Code: 123456                   │
-│  Valid for: 02 minutes                       │
-│                                               │
-└──────────────────────────────────────────────┘
-```
+- SIM card auto-detection and verification
+- Email OTP (6 digits, cryptographically secure)
+- Challenge-response authentication with device tracking
+- Account recovery via registered email
+- JWT session tokens (validated on every protected request)
+- Full audit logging
+- Rate limiting (Redis with in-memory fallback)
+- Multi-device management
 
-### ✅ Automated Fallback
-```
-┌─────────────┐
-│ Read SIM    │
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐    Match     ┌───────────┐
-│   Compare   │──────────────▶│  SUCCESS  │
-└──────┬──────┘              └───────────┘
-       │ No Match
-       ▼
-┌─────────────────────┐
-│   Fallback:         │
-│ 1. Manual Entry     │
-│ 2. Email OTP (6 num)│
-└─────────────────────┘
-```
+## Security changes in v3.0
 
----
+- OTP generated with `secrets.randbelow` (CSPRNG) — replaces insecure `random.randint`
+- OTP stored as HMAC-SHA256 hash — never as plaintext
+- OTP comparison uses `hmac.compare_digest` — prevents timing attacks
+- All protected endpoints require `Authorization: Bearer <token>`
+- Account recovery returns identical response regardless of match — prevents user enumeration
+- `SECRET_KEY` and `JWT_SECRET` raise errors at startup if unset in production
+- CORS limited to explicit origin list — no wildcards in production
+- SIM verification does not store raw phone numbers in the database
 
-## 🚀 Getting Started
+## Quick start
 
 ```bash
-# 1. Create Environment
-python -m venv venv
-
-# Windows
-venv\Scripts\activate
-# Mac/Linux
-# source venv/bin/activate
-
-# 2. Install Requirements
-pip install -r requirements.txt
-
-# 3. Run Server
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+cp .env.example .env
+# Edit .env — set SECRET_KEY, JWT_SECRET, and SMTP credentials at minimum
+bash start.sh
 ```
 
----
-
-## 📱 Endpoints
-
-### SIM Verification
-```
-POST /auth/sim/detect
-→ Instructions for SIM reading
-
-POST /auth/sim/verify
-→ Verification of SIM match
-→ If matched: sim_verified = true
-→ If not matched: fallback = email_otp
-```
-
-### Email OTP (6 Digits)
-```
-POST /auth/link-email
-→ Send 6-digit code to email
-
-POST /auth/verify-otp
-→ Verify 6-digit code
-```
-
-### Registration & Login
-```
-POST /auth/register
-POST /auth/challenge
-POST /auth/verify-challenge
-```
-
----
-
-## 📋 Flutter Example
-
-```dart
-// 1. Read SIM number
-import 'package:sim_card_info/sim_card_info.dart';
-
-final SimCardInfo simCardInfo = SimCardInfo();
-final simInfo = await simCardInfo.getSimInfo();
-String? simPhone = simInfo.phoneNumber;
-
-// 2. Verify
-final response = await http.post(
-  Uri.parse('https://api.com/auth/sim/verify'),
-  body: jsonEncode({
-    'sim_phone': simPhone,
-    'entered_phone': userPhone,
-    'country_code': 'SA',
-    'device_id': deviceId,
-  }),
-);
-
-final data = jsonDecode(response.body);
-
-if (data['status'] == 'sim_verified') {
-  // ✅ SIM matched - Fast registration
-  registerUser(data['phone']);
-} else {
-  // ❌ Not matched - Use Email OTP
-  // Send 6-digit code to email
-  await sendEmailOtp(data['sim_info']['sim_phone'], email);
-}
-```
-
----
-
-## ⚙️ Environment Variables
-
-Create a `.env` file in the `backend` directory based on the `.env.example` file.
-
-### How to generate your Keys:
-1. **SECRET_KEY & JWT_SECRET:** Run this command in your terminal to generate cryptographically secure random strings:
-   ```bash
-   python -c "import secrets; print(secrets.token_hex(32))"
-   ```
-2. **SMTP_PASSWORD (Google):** 
-   - Go to your Google Account -> **Security**.
-   - Enable **2-Step Verification**.
-   - Go to **App passwords**.
-   - Create a new app password for "SIBNA Auth" and use the generated 16-character code here.
+## Docker
 
 ```bash
-# Security
-SECRET_KEY=paste_generated_key_here
-JWT_SECRET=paste_generated_key_here
-
-# Email SMTP
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=465
-SMTP_USERNAME=your-app@gmail.com
-SMTP_PASSWORD=your-google-app-password
-
-# OTP Timing
-OTP_EXPIRY=120
-JWT_EXPIRY_DAYS=30
+cp .env.example .env
+# Edit .env
+docker compose up --build
 ```
 
----
+## Environment variables
 
-## 🌍 Supported Countries
+See `.env.example` for the full list.
 
-39 countries including:
-- 🇸🇦 Saudi Arabia, 🇪🇬 Egypt, 🇦🇪 UAE
-- 🇰🇼 Kuwait, 🇶🇦 Qatar, 🇧🇭 Bahrain, 🇴🇲 Oman
-- 🇯🇴 Jordan, 🇱🇧 Lebanon, 🇸🇾 Syria, 🇮🇶 Iraq
-- 🇲🇦 Morocco, 🇩🇿 Algeria, 🇹🇳 Tunisia, 🇱🇾 Libya
-- 🇺🇸 USA, 🇬🇧 UK, 🇩🇪 Germany, 🇫🇷 France
-- And more...
+Generate secure values:
+```bash
+python3 -c "import secrets; print(secrets.token_hex(32))"
+```
 
+## API endpoints
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| POST | `/auth/sim/verify` | No | Verify SIM number |
+| POST | `/auth/register` | No | Register new account |
+| POST | `/auth/challenge` | No | Request login challenge |
+| POST | `/auth/verify-challenge` | No | Verify challenge, get token |
+| POST | `/auth/link-email` | No | Send email OTP |
+| POST | `/auth/verify-otp` | No | Verify OTP, get token |
+| POST | `/auth/recovery/initiate` | No | Start account recovery |
+| POST | `/auth/update-profile` | Yes | Update name |
+| GET | `/auth/me` | Yes | Get own account info |
+| GET | `/auth/devices` | Yes | List registered devices |
+| DELETE | `/auth/devices` | Yes | Remove a device |
+| POST | `/auth/validate-phone` | No | Validate phone number |
+| GET | `/health` | No | Health check |

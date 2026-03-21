@@ -1,3 +1,4 @@
+import 'package:google_fonts/google_fonts.dart';
 import 'package:flutter/material.dart';
 import '../constants/constants.dart';
 
@@ -6,7 +7,7 @@ class AppTheme {
     return ThemeData(
       useMaterial3: true,
       brightness: Brightness.light,
-      fontFamily: 'Outfit', // High-end font
+      // Font via google_fonts — Outfit loaded dynamically
       scaffoldBackgroundColor: AppColors.background,
       colorScheme: ColorScheme.light(
         primary: AppColors.primary,
@@ -16,15 +17,15 @@ class AppTheme {
         onPrimary: Colors.white,
         onSurface: AppColors.textHeader,
       ),
-      textTheme: const TextTheme(
-        displayLarge: TextStyle(fontWeight: FontWeight.w700, color: AppColors.textHeader, fontSize: 34, letterSpacing: -1.0),
-        displayMedium: TextStyle(fontWeight: FontWeight.w700, color: AppColors.textHeader, fontSize: 26, letterSpacing: -0.5),
-        headlineMedium: TextStyle(fontWeight: FontWeight.w600, color: AppColors.textHeader, fontSize: 24, letterSpacing: -0.5),
-        titleLarge: TextStyle(fontWeight: FontWeight.w600, color: AppColors.textHeader, fontSize: 22),
-        titleMedium: TextStyle(fontWeight: FontWeight.w500, color: AppColors.textHeader, fontSize: 18),
-        bodyLarge: TextStyle(color: AppColors.textHeader, fontSize: 17, height: 1.4),
-        bodyMedium: TextStyle(color: AppColors.textBody, fontSize: 15, height: 1.4),
-        bodySmall: TextStyle(color: AppColors.textBody, fontSize: 13, height: 1.4),
+      textTheme: GoogleFonts.outfitTextTheme().copyWith(
+        displayLarge: GoogleFonts.outfit(fontWeight: FontWeight.w700, color: AppColors.textHeader, fontSize: 34, letterSpacing: -1.0),
+        displayMedium: GoogleFonts.outfit(fontWeight: FontWeight.w700, color: AppColors.textHeader, fontSize: 26, letterSpacing: -0.5),
+        headlineMedium: GoogleFonts.outfit(fontWeight: FontWeight.w600, color: AppColors.textHeader, fontSize: 24, letterSpacing: -0.5),
+        titleLarge: GoogleFonts.outfit(fontWeight: FontWeight.w600, color: AppColors.textHeader, fontSize: 22),
+        titleMedium: GoogleFonts.outfit(fontWeight: FontWeight.w500, color: AppColors.textHeader, fontSize: 18),
+        bodyLarge: GoogleFonts.outfit(color: AppColors.textHeader, fontSize: 17, height: 1.4),
+        bodyMedium: GoogleFonts.outfit(color: AppColors.textBody, fontSize: 15, height: 1.4),
+        bodySmall: GoogleFonts.outfit(color: AppColors.textBody, fontSize: 13, height: 1.4),
       ),
       elevatedButtonTheme: ElevatedButtonThemeData(
         style: ElevatedButton.styleFrom(
